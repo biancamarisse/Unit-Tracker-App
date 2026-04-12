@@ -79,10 +79,10 @@
     const loadUnits      = ()                          => scriptCall({ action: "getUnits" });
     const loadTransfers  = (sn)                        => scriptCall({ action: "getTransfers", serialNumber: sn });
     const loadHistory    = (sn)                        => scriptCall({ action: "getHistory",   serialNumber: sn });
-    const saveOwnership  = (unit, owner, fw, model, project, list) =>
-      scriptCall({ action: "saveOwnership", unit, newOwner: owner, fw: fw||"", model: model||"", project: project||"", list: list||"" });
-    const saveTransfer   = (sn, dn, prev, next, act)   =>
-      scriptCall({ action: "saveTransfer", serialNumber: sn, deviceName: dn, prevOwner: prev||"", newOwner: next, transferAction: act });
+    const saveOwnership  = (unit, owner, fw, model, project, list, team) =>
+      scriptCall({ action: "saveOwnership", unit, newOwner: owner, fw: fw||"", model: model||"", project: project||"", list: list||"", team: team||"" });
+    const saveTransfer   = (sn, dn, prev, next, act, team)   =>
+      scriptCall({ action: "saveTransfer", serialNumber: sn, deviceName: dn, prevOwner: prev||"", newOwner: next, transferAction: act, team: team||"" });
     const saveHistoryCall = (sn, dn, entries) =>
       scriptCall({ action: "saveHistory", serialNumber: sn, deviceName: dn, entries });
     const saveFirmwareOnly = (unitId, fw)              => scriptCall({ action: "saveFirmwareOnly", unitId, fw });
@@ -170,31 +170,80 @@
     // NAME PROMPT MODAL
     // ─────────────────────────────────────────────────────────────────────────
 
-    function NamePromptModal({ onSave }) {
-      const [name, setName] = useState("");
-      const submit = () => { const n = name.trim(); if (n) onSave(n); };
+    const DEFAULT_TEAMS = ["PD", "EE", "UXR", "SW"];
+
+    function NamePromptModal({ onSave, initialData, extraTeams = [] }) {
+      const [firstName,   setFirstName]   = useState(initialData?.firstName || "");
+      const [lastName,    setLastName]    = useState(initialData?.lastName  || "");
+      const [team,        setTeam]        = useState(initialData?.team      || "");
+      const [addingTeam,  setAddingTeam]  = useState(false);
+      const [newTeamVal,  setNewTeamVal]  = useState("");
+      const allTeams = [...DEFAULT_TEAMS, ...extraTeams.filter(t => !DEFAULT_TEAMS.includes(t))];
+      const isValid = firstName.trim() && lastName.trim() && team.trim();
+
+      const submit = () => { if (isValid) onSave(firstName.trim(), lastName.trim(), team.trim()); };
+
+      const commitNewTeam = () => {
+        const t = newTeamVal.trim();
+        if (t) { setTeam(t); setNewTeamVal(""); }
+        setAddingTeam(false);
+      };
+
       return (
         <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", backdropFilter:"blur(12px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:300, padding:"20px" }}>
-          <div style={{ background:"#17171b", border:`1px solid ${C.border}`, borderRadius:"20px", width:"100%", maxWidth:"380px", padding:"32px 28px", boxShadow:"0 32px 100px rgba(0,0,0,0.8)", textAlign:"center" }}>
-            {/* Backbone logo */}
-            <div style={{ width:"52px", height:"52px", background:C.orange, borderRadius:"14px", display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"900", fontSize:"26px", margin:"0 auto 20px" }}>B</div>
-            <div style={{ fontWeight:"700", fontSize:"20px", marginBottom:"8px" }}>Welcome to Unit Tracker</div>
-            <div style={{ color:C.muted, fontSize:"14px", lineHeight:"1.65", marginBottom:"28px" }}>
-              Enter your name once and it'll be remembered every time you open the app.
+          <div style={{ background:"#17171b", border:`1px solid ${C.border}`, borderRadius:"20px", width:"100%", maxWidth:"420px", padding:"32px 28px", boxShadow:"0 32px 100px rgba(0,0,0,0.8)" }}>
+            <div style={{ textAlign:"center", marginBottom:"24px" }}>
+              <div style={{ width:"52px", height:"52px", background:C.orange, borderRadius:"14px", display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"900", fontSize:"26px", margin:"0 auto 16px" }}>B</div>
+              <div style={{ fontWeight:"700", fontSize:"20px", marginBottom:"6px" }}>Welcome to Unit Tracker</div>
+              <div style={{ color:C.muted, fontSize:"13px", lineHeight:"1.6" }}>Your details are saved and remembered each session.</div>
             </div>
-            <input
-              autoFocus
-              value={name}
-              onChange={e => setName(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && submit()}
-              placeholder="Your name…"
-              style={{ ...inputSty, textAlign:"center", fontSize:"16px", padding:"12px 16px", marginBottom:"14px" }}
-            />
-            <button
-              onClick={submit}
-              disabled={!name.trim()}
-              style={{ ...btnOrange, width:"100%", fontSize:"15px", padding:"13px", opacity: name.trim() ? 1 : 0.45 }}
-            >
+
+            {/* Name row */}
+            <div style={{ display:"flex", gap:"10px", marginBottom:"16px" }}>
+              <div style={{ flex:1 }}>
+                <div style={{ fontSize:"11px", color:C.muted, marginBottom:"5px", fontWeight:"600", textTransform:"uppercase", letterSpacing:"0.05em" }}>First Name <span style={{color:C.orange}}>*</span></div>
+                <input autoFocus value={firstName} onChange={e => setFirstName(e.target.value)}
+                  onKeyDown={e => e.key==="Enter" && isValid && submit()}
+                  placeholder="First…" style={{ ...inputSty, width:"100%", boxSizing:"border-box" }} />
+              </div>
+              <div style={{ flex:1 }}>
+                <div style={{ fontSize:"11px", color:C.muted, marginBottom:"5px", fontWeight:"600", textTransform:"uppercase", letterSpacing:"0.05em" }}>Last Name <span style={{color:C.orange}}>*</span></div>
+                <input value={lastName} onChange={e => setLastName(e.target.value)}
+                  onKeyDown={e => e.key==="Enter" && isValid && submit()}
+                  placeholder="Last…" style={{ ...inputSty, width:"100%", boxSizing:"border-box" }} />
+              </div>
+            </div>
+
+            {/* Team selector */}
+            <div style={{ marginBottom:"24px" }}>
+              <div style={{ fontSize:"11px", color:C.muted, marginBottom:"8px", fontWeight:"600", textTransform:"uppercase", letterSpacing:"0.05em" }}>Team <span style={{color:C.orange}}>*</span></div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:"8px" }}>
+                {allTeams.map(t => (
+                  <button key={t} onClick={() => setTeam(t)}
+                    style={{ padding:"7px 16px", borderRadius:"20px", fontSize:"13px", fontWeight:"600", cursor:"pointer", border:`1px solid ${team===t ? C.orange : C.border}`, background: team===t ? C.orange+"20" : "transparent", color: team===t ? C.orange : C.muted, transition:"all 0.15s" }}>
+                    {t}
+                  </button>
+                ))}
+                {addingTeam ? (
+                  <div style={{ display:"flex", gap:"6px", alignItems:"center" }}>
+                    <input autoFocus value={newTeamVal} onChange={e => setNewTeamVal(e.target.value)}
+                      onKeyDown={e => { if (e.key==="Enter") commitNewTeam(); if (e.key==="Escape") { setAddingTeam(false); setNewTeamVal(""); } }}
+                      placeholder="Team name…"
+                      style={{ ...inputSty, padding:"5px 10px", fontSize:"12px", width:"110px" }} />
+                    <button onClick={commitNewTeam} style={{ ...btnSmall, color:C.orange, borderColor:C.orange+"50", background:C.orange+"10" }}>Add</button>
+                    <button onClick={() => { setAddingTeam(false); setNewTeamVal(""); }} style={btnSmall}>✕</button>
+                  </div>
+                ) : (
+                  <button onClick={() => setAddingTeam(true)}
+                    style={{ padding:"7px 12px", borderRadius:"20px", fontSize:"13px", cursor:"pointer", border:`1px dashed ${C.border}`, background:"transparent", color:C.muted }}>
+                    + Other
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <button onClick={submit} disabled={!isValid}
+              style={{ ...btnOrange, width:"100%", fontSize:"15px", padding:"13px", opacity: isValid ? 1 : 0.4 }}>
               Let's go →
             </button>
           </div>
@@ -252,8 +301,12 @@
       const [authState, setAuthState]           = useState("loading");
       const [units, setUnits]                   = useState([]);
       const [currentUser, setCurrentUser]       = useState(() => localStorage.getItem("bb_tracker_user") || "");
-      const [showNamePrompt, setShowNamePrompt] = useState(() => !localStorage.getItem("bb_tracker_user"));
+      const [currentTeam, setCurrentTeam]       = useState(() => localStorage.getItem("bb_tracker_team") || "");
+      const [showNamePrompt, setShowNamePrompt] = useState(() => !localStorage.getItem("bb_tracker_user") || !localStorage.getItem("bb_tracker_team"));
       const [nameEditMode, setNameEditMode]     = useState(false);
+      const [customTeams, setCustomTeams]       = useState(() => {
+        try { return JSON.parse(localStorage.getItem("bb_custom_teams") || "[]"); } catch { return []; }
+      });
       const [customModels, setCustomModels]     = useState(() => {
         try { return JSON.parse(localStorage.getItem("bb_custom_models") || "[]"); } catch { return []; }
       });
@@ -387,8 +440,8 @@
           if (IS_CONFIGURED) {
             setSyncing(true);
             try {
-              await saveOwnership(dm, owner, fw, model, project, list);
-              await saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, owner, "ownership_change");
+              await saveOwnership(dm, owner, fw, model, project, list, currentTeam);
+              await saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, owner, "ownership_change", currentTeam);
               await refresh();
             } catch (e) { setError("Save failed: " + e.message); }
             finally { setSyncing(false); }
@@ -405,7 +458,7 @@
           if (IS_CONFIGURED) {
             try {
               await Promise.all([
-                saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, dm.currentOwner, "check_in"),
+                saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, dm.currentOwner, "check_in", currentTeam),
                 updateUnit(dm.id, { lastSeen: today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{}) }),
               ]);
               await refresh();
@@ -561,30 +614,19 @@
               {authState === "loading" && <span style={{ color:C.muted, fontSize:"13px" }}>Connecting…</span>}
               {authState === "ready"   && <div style={{ width:"7px", height:"7px", background:C.green, borderRadius:"50%" }} />}
               {authState === "error"   && <button onClick={() => { setError(null); setAuthState("loading"); initSheet().then(()=>loadUnits()).then(d=>{setUnits(d);setAuthState("ready");}).catch(e=>{setError(e.message);setAuthState("error");}); }} style={{ ...btnOrange, padding:"5px 12px", fontSize:"12px" }}>Retry</button>}
-              {nameEditMode ? (
-                <div style={{ display:"flex", gap:"6px", alignItems:"center" }}>
-                  <input
-                    autoFocus
-                    value={currentUser}
-                    onChange={e => { setCurrentUser(e.target.value); localStorage.setItem("bb_tracker_user", e.target.value); }}
-                    onKeyDown={e => { if (e.key === "Enter" || e.key === "Escape") setNameEditMode(false); }}
-                    onBlur={() => setNameEditMode(false)}
-                    placeholder="Your name…"
-                    style={{ ...inputSty, width:"150px", padding:"5px 10px", fontSize:"13px" }}
-                  />
-                </div>
-              ) : (
-                <button
-                  onClick={() => { if (currentUser) setNameEditMode(true); else setShowNamePrompt(true); }}
-                  style={{ display:"flex", alignItems:"center", gap:"8px", background:"none", border:`1px solid ${C.border}`, borderRadius:"20px", color:C.text, cursor:"pointer", padding:"4px 10px 4px 4px", transition:"border-color 0.15s" }}
-                  title="Click to change name"
-                >
-                  <Avatar name={currentUser || "?"} size={26} />
-                  <span style={{ fontSize:"13px", fontWeight: currentUser ? "600" : "400", color: currentUser ? C.text : C.muted }}>
+              <button
+                onClick={() => setShowNamePrompt(true)}
+                style={{ display:"flex", alignItems:"center", gap:"8px", background:"none", border:`1px solid ${C.border}`, borderRadius:"20px", color:C.text, cursor:"pointer", padding:"4px 10px 4px 4px", transition:"border-color 0.15s" }}
+                title="Click to update your profile"
+              >
+                <Avatar name={currentUser || "?"} size={26} />
+                <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-start", gap:"1px" }}>
+                  <span style={{ fontSize:"13px", fontWeight: currentUser ? "600" : "400", color: currentUser ? C.text : C.muted, lineHeight:"1.2" }}>
                     {currentUser || "Set your name"}
                   </span>
-                </button>
-              )}
+                  {currentTeam && <span style={{ fontSize:"10px", color:C.orange, fontWeight:"600", lineHeight:"1.2" }}>{currentTeam}</span>}
+                </div>
+              </button>
             </div>
           </header>
 
@@ -614,7 +656,20 @@
           {deviceModal  && <DeviceModal device={deviceModal} currentUser={currentUser} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} onRespond={handleOwnership} onClose={() => setDeviceModal(null)} />}
           {selectedUnit && <UnitDetailModal unit={selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} />}
           {addToListModal && <AddToListModal listName={addToListModal.listName} units={units.filter(u => !u.archived)} onAddSelected={async (ids) => { for (const id of ids) { await handleUnitEdit(id, { list: addToListModal.listName }); } setAddToListModal(null); }} onConnectNew={() => handleConnectNewForList(addToListModal.listName)} onClose={() => setAddToListModal(null)} />}
-          {showNamePrompt && <NamePromptModal onSave={(name) => { setCurrentUser(name); localStorage.setItem("bb_tracker_user", name); setShowNamePrompt(false); }} />}
+          {showNamePrompt && <NamePromptModal
+            extraTeams={customTeams}
+            initialData={{ firstName: currentUser.split(" ")[0]||"", lastName: currentUser.split(" ").slice(1).join(" ")||"", team: currentTeam }}
+            onSave={(first, last, team) => {
+              const fullName = `${first} ${last}`;
+              setCurrentUser(fullName); localStorage.setItem("bb_tracker_user", fullName);
+              setCurrentTeam(team);     localStorage.setItem("bb_tracker_team", team);
+              if (!DEFAULT_TEAMS.includes(team) && !customTeams.includes(team)) {
+                const updated = [...customTeams, team];
+                setCustomTeams(updated); localStorage.setItem("bb_custom_teams", JSON.stringify(updated));
+              }
+              setShowNamePrompt(false);
+            }}
+          />}
         </div>
       );
     }
