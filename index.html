@@ -1252,8 +1252,8 @@
           </div>
 
           <div style={cardSty}>
-            <div style={{ display:"grid", gridTemplateColumns:"1.5fr 0.8fr 0.8fr 0.9fr 1fr 0.7fr 0.85fr 1.1fr", gap:"12px", padding:"8px 14px 12px", borderBottom:`1px solid ${C.border}` }}>
-              {["Device Name","List","Project","Type","Serial #","Firmware","Owner","Notes"].map(h => <div key={h} style={labelSty}>{h}</div>)}
+            <div style={{ display:"grid", gridTemplateColumns:"1.5fr 0.8fr 0.8fr 0.9fr 1fr 0.7fr 0.85fr 0.7fr 1.1fr", gap:"12px", padding:"8px 14px 12px", borderBottom:`1px solid ${C.border}` }}>
+              {["Device Name","List","Project","Type","Serial #","Firmware","Owner","Team","Notes"].map(h => <div key={h} style={labelSty}>{h}</div>)}
             </div>
             {units.length === 0
               ? <div style={{ padding:"48px", textAlign:"center", color:C.muted }}>No units match your filters</div>
@@ -1271,7 +1271,7 @@
       const lc = listColor(unit.list, lists || []);
       return (
         <div onClick={onSelect} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
-          style={{ display:"grid", gridTemplateColumns:"1.5fr 0.8fr 0.8fr 0.9fr 1fr 0.7fr 0.85fr 1.1fr", gap:"12px", padding:"14px", borderRadius:"8px", cursor:"pointer", background:hov?C.item:"transparent", borderBottom:isLast?"none":`1px solid ${C.border}40`, transition:"background 0.1s", alignItems:"center", opacity: unit.archived ? 0.5 : 1 }}>
+          style={{ display:"grid", gridTemplateColumns:"1.5fr 0.8fr 0.8fr 0.9fr 1fr 0.7fr 0.85fr 0.7fr 1.1fr", gap:"12px", padding:"14px", borderRadius:"8px", cursor:"pointer", background:hov?C.item:"transparent", borderBottom:isLast?"none":`1px solid ${C.border}40`, transition:"background 0.1s", alignItems:"center", opacity: unit.archived ? 0.5 : 1 }}>
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:"8px" }}>
               <span style={{ fontWeight:"600", fontSize:"14px" }}>{unit.deviceName}</span>
@@ -1288,6 +1288,7 @@
             <Avatar name={unit.owner||"?"} size={26} />
             <span style={{ fontSize:"13px" }}>{unit.owner}</span>
           </div>
+          <div>{unit.team ? <Tag color={C.orange+"99"}>{unit.team}</Tag> : <span style={{ color:"#444", fontSize:"12px" }}>—</span>}</div>
           <div style={{ fontSize:"12px", color:C.muted, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis" }}>
             {unit.notes || <span style={{ color:"#333" }}>—</span>}
           </div>
@@ -1535,6 +1536,7 @@
                     { label:"List",             value:unit.list       || "—" },
                     { label:"Firmware Version", value:unit.firmwareVersion || "—", mono:true },
                     { label:"Current Owner",    value:unit.owner,                  orange:true },
+                    { label:"Team",             value:unit.team       || "—" },
                     { label:"Last Seen",        value:unit.lastSeen },
                   ].map(({ label, value, mono, orange }) => (
                     <div key={label}>
