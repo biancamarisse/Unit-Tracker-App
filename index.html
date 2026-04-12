@@ -473,7 +473,7 @@
         setDeviceModal(null); // close modal only after everything is saved
       };
 
-      const FIELD_LABELS = { deviceName:"Device Name", firmwareVersion:"Firmware", type:"Type", project:"Project", list:"List", owner:"Owner", notes:"Notes", lastSeen:"Last Seen", archived:"Archived", links:"Links", event:"Event" };
+      const FIELD_LABELS = { deviceName:"Device Name", firmwareVersion:"Firmware", type:"Type", project:"Project", list:"List", owner:"Owner", notes:"Notes", lastSeen:"Last Seen", archived:"Archived", links:"Links", event:"Event", team:"Team" };
 
       const handleUnitEdit = async (unitId, changes) => {
         const currentUnit = units.find(u => u.id === unitId);
@@ -654,7 +654,7 @@
           </div>
 
           {deviceModal  && <DeviceModal device={deviceModal} currentUser={currentUser} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} onRespond={handleOwnership} onClose={() => setDeviceModal(null)} />}
-          {selectedUnit && <UnitDetailModal unit={selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} />}
+          {selectedUnit && <UnitDetailModal unit={selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} currentTeam={currentTeam} currentUser={currentUser} customTeams={customTeams} allUnits={units} />}
           {addToListModal && <AddToListModal listName={addToListModal.listName} units={units.filter(u => !u.archived)} onAddSelected={async (ids) => { for (const id of ids) { await handleUnitEdit(id, { list: addToListModal.listName }); } setAddToListModal(null); }} onConnectNew={() => handleConnectNewForList(addToListModal.listName)} onClose={() => setAddToListModal(null)} />}
           {showNamePrompt && <NamePromptModal
             extraTeams={customTeams}
@@ -1300,7 +1300,7 @@
     // UNIT DETAIL MODAL  (with edit mode)
     // ─────────────────────────────────────────────────────────────────────────
 
-    function UnitDetailModal({ unit, allModels, onAddModel, allProjects, onAddProject, allEvents, onAddEvent, lists, onEdit, onDelete, onClose }) {
+    function UnitDetailModal({ unit, allModels, onAddModel, allProjects, onAddProject, allEvents, onAddEvent, lists, onEdit, onDelete, onClose, currentTeam, currentUser, customTeams = [], allUnits = [] }) {
       const [transfers, setTransfers]         = useState([]);
       const [editHistory, setEditHistory]     = useState([]);
       const [loadingHist, setLoadingHist]     = useState(false);
@@ -1316,6 +1316,20 @@
       const [editNotes, setEditNotes]         = useState(unit.notes || "");
       const [editEvent, setEditEvent]         = useState(unit.event || "");
       const [editLinks, setEditLinks]         = useState(() => Array.isArray(unit.links) ? [...unit.links] : []);
+      // Build a name→team map from all known units
+      const ownerTeamMap = React.useMemo(() => {
+        const map = {};
+        allUnits.forEach(u => { if (u.owner && u.team) map[u.owner.toLowerCase()] = u.team; });
+        return map;
+      }, [allUnits]);
+
+      const resolveTeam = (ownerName) => {
+        if (!ownerName) return "";
+        if (ownerName.toLowerCase() === (currentUser||"").toLowerCase()) return currentTeam || "";
+        return ownerTeamMap[ownerName.toLowerCase()] || "";
+      };
+
+      const [editTeam, setEditTeam]           = useState(unit.team || currentTeam || "");
       const [saving, setSaving]               = useState(false);
       const [addingModel, setAddingModel]     = useState(false);
       const [newModel, setNewModel]           = useState("");
@@ -1344,7 +1358,7 @@
       const handleSave = async () => {
         setSaving(true);
         const cleanLinks = editLinks.filter(l => l.url.trim());
-        await onEdit(unit.id, { deviceName: editName, firmwareVersion: editFw, type: editModel, project: editProject, list: editList, owner: editOwner, notes: editNotes, event: editEvent, links: cleanLinks });
+        await onEdit(unit.id, { deviceName: editName, firmwareVersion: editFw, type: editModel, project: editProject, list: editList, owner: editOwner, notes: editNotes, event: editEvent, links: cleanLinks, team: editTeam });
         setSaving(false);
         setEditing(false);
         onClose();
@@ -1471,9 +1485,41 @@
                     <input value={editFw} onChange={e => setEditFw(e.target.value)} placeholder="e.g. v2.5.1" style={{ ...inputSty, fontFamily:"monospace" }} />
                   </div>
 
-                  <div>
+                  <div style={{ gridColumn: "1 / -1" }}>
                     <div style={{ ...labelSty, marginBottom:"6px" }}>Owner</div>
-                    <input value={editOwner} onChange={e => setEditOwner(e.target.value)} placeholder="Name…" style={inputSty} />
+                    <input value={editOwner}
+                      onChange={e => {
+                        const name = e.target.value;
+                        setEditOwner(name);
+                        const found = resolveTeam(name);
+                        setEditTeam(found);
+                      }}
+                      placeholder="Name…" style={inputSty} />
+                    {/* Show team selector if owner changed and team is unknown */}
+                    {editOwner && editOwner !== unit.owner && !editTeam && (
+                      <div style={{ marginTop:"10px", padding:"12px 14px", background:C.orange+"10", border:`1px solid ${C.orange}30`, borderRadius:"10px" }}>
+                        <div style={{ fontSize:"12px", color:C.orange, fontWeight:"600", marginBottom:"8px" }}>
+                          What team is {editOwner} on?
+                        </div>
+                        <div style={{ display:"flex", flexWrap:"wrap", gap:"6px" }}>
+                          {[...DEFAULT_TEAMS, ...customTeams.filter(t => !DEFAULT_TEAMS.includes(t))].map(t => (
+                            <button key={t} onClick={() => setEditTeam(t)}
+                              style={{ padding:"5px 14px", borderRadius:"20px", fontSize:"12px", fontWeight:"600", cursor:"pointer", border:`1px solid ${C.border}`, background:"transparent", color:C.muted, transition:"all 0.15s" }}>
+                              {t}
+                            </button>
+                          ))}
+                          <input placeholder="Other…" onKeyDown={e => { if (e.key==="Enter" && e.target.value.trim()) { setEditTeam(e.target.value.trim()); e.target.value=""; } }}
+                            style={{ ...inputSty, padding:"4px 10px", fontSize:"12px", width:"90px" }} />
+                        </div>
+                      </div>
+                    )}
+                    {editOwner && editOwner !== unit.owner && editTeam && (
+                      <div style={{ marginTop:"6px", display:"flex", alignItems:"center", gap:"6px" }}>
+                        <span style={{ fontSize:"12px", color:C.muted }}>Team:</span>
+                        <Tag color={C.orange+"99"}>{editTeam}</Tag>
+                        <button onClick={() => setEditTeam("")} style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:"12px", padding:0 }}>✕ change</button>
+                      </div>
+                    )}
                   </div>
 
                   <div>
@@ -1522,7 +1568,7 @@
 
                   <div style={{ display:"flex", gap:"10px", marginTop:"4px" }}>
                     <button onClick={handleSave} disabled={saving} style={{ ...btnOrange, flex:1, opacity:saving?0.7:1 }}>{saving ? "Saving…" : "Save Changes"}</button>
-                    <button onClick={() => { setEditing(false); setEditName(unit.deviceName); setEditFw(unit.firmwareVersion); setEditModel(unit.type); setEditProject(unit.project||""); setEditList(unit.list||""); setEditOwner(unit.owner||""); setEditNotes(unit.notes||""); setEditEvent(unit.event||""); setEditLinks(Array.isArray(unit.links)?[...unit.links]:[]); }} style={{ ...btnGhost, flex:1 }}>Cancel</button>
+                    <button onClick={() => { setEditing(false); setEditName(unit.deviceName); setEditFw(unit.firmwareVersion); setEditModel(unit.type); setEditProject(unit.project||""); setEditList(unit.list||""); setEditOwner(unit.owner||""); setEditNotes(unit.notes||""); setEditEvent(unit.event||""); setEditLinks(Array.isArray(unit.links)?[...unit.links]:[]); setEditTeam(unit.team||currentTeam||""); }} style={{ ...btnGhost, flex:1 }}>Cancel</button>
                   </div>
                 </div>
               </div>
@@ -1536,7 +1582,6 @@
                     { label:"List",             value:unit.list       || "—" },
                     { label:"Firmware Version", value:unit.firmwareVersion || "—", mono:true },
                     { label:"Current Owner",    value:unit.owner,                  orange:true },
-                    { label:"Team",             value:unit.team       || "—" },
                     { label:"Last Seen",        value:unit.lastSeen },
                   ].map(({ label, value, mono, orange }) => (
                     <div key={label}>
@@ -1544,6 +1589,15 @@
                       <div style={{ fontSize:"14px", fontWeight:"600", marginTop:"5px", fontFamily:mono?"monospace":"inherit", color:orange?C.orange:C.text }}>{value||"—"}</div>
                     </div>
                   ))}
+                  {/* Team — read-only, tied to owner */}
+                  <div>
+                    <div style={labelSty}>Team</div>
+                    <div style={{ marginTop:"5px" }}>
+                      {unit.team
+                        ? <Tag color={C.orange+"99"}>{unit.team}</Tag>
+                        : <span style={{ fontSize:"14px", color:"#444" }}>—</span>}
+                    </div>
+                  </div>
                   {unit.event && (
                     <div>
                       <div style={labelSty}>Event</div>
