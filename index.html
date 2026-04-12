@@ -608,7 +608,7 @@
           <div style={{ padding:"24px", maxWidth:"1000px", margin:"0 auto" }}>
             {tab === "connect" && <ConnectTab connecting={connecting} lastEvent={lastEvent} activity={activity} units={activeUnits} currentUser={currentUser} isReady={authState==="ready"} onSimulate={simulate} onDevicePaired={handleDevicePaired} onShowAll={showAllUnits} onReset={() => setLastEvent(null)} />}
             {tab === "units"   && <UnitsTab units={filtered} totalUnits={activeUnits} allOwners={allOwners} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} listFilter={listFilter} setListFilter={setListFilter} search={search} setSearch={setSearch} modelFilter={modelFilter} setModelFilter={setModelFilter} projectFilter={projectFilter} setProjectFilter={setProjectFilter} ownerFilter={ownerFilter} setOwnerFilter={setOwnerFilter} lastSeenFilter={lastSeenFilter} clearLastSeenFilter={() => setLastSeenFilter("")} showArchived={showArchived} setShowArchived={setShowArchived} sortOrder={sortOrder} setSortOrder={setSortOrder} onSelect={u => setSelectedUnit(u)} />}
-            {tab === "lists"   && <ListsTab lists={lists} units={units} onAdd={addList} onUpdate={updateList} onDelete={deleteList} onAddDevices={(name, id) => setAddToListModal({ listName: name, listId: id })} />}
+            {tab === "lists"   && <ListsTab lists={lists} units={units} onAdd={addList} onUpdate={updateList} onDelete={deleteList} onAddDevices={(name, id) => setAddToListModal({ listName: name, listId: id })} onSelect={u => setSelectedUnit(u)} />}
           </div>
 
           {deviceModal  && <DeviceModal device={deviceModal} currentUser={currentUser} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} onRespond={handleOwnership} onClose={() => setDeviceModal(null)} />}
@@ -1693,7 +1693,7 @@
     // LISTS TAB
     // ─────────────────────────────────────────────────────────────────────────
 
-    function ListsTab({ lists, units, onAdd, onUpdate, onDelete, onAddDevices }) {
+    function ListsTab({ lists, units, onAdd, onUpdate, onDelete, onAddDevices, onSelect }) {
       const [newName, setNewName]           = useState("");
       const [adding, setAdding]             = useState(false);
       const [editId, setEditId]             = useState(null);
@@ -1785,7 +1785,10 @@
                     {isExpanded && (
                       <div style={{ borderTop:`1px solid ${C.border}` }}>
                         {devices.map((u, i) => (
-                          <div key={u.id} style={{ display:"flex", alignItems:"center", gap:"14px", padding:"11px 20px 11px 46px", borderBottom: i < devices.length-1 ? `1px solid ${C.border}40` : "none", background: C.item+"60" }}>
+                          <div key={u.id} onClick={() => onSelect && onSelect(u)}
+                            style={{ display:"flex", alignItems:"center", gap:"14px", padding:"11px 20px 11px 46px", borderBottom: i < devices.length-1 ? `1px solid ${C.border}40` : "none", background: C.item+"60", cursor:"pointer", transition:"background 0.15s" }}
+                            onMouseEnter={e => e.currentTarget.style.background = C.item+"cc"}
+                            onMouseLeave={e => e.currentTarget.style.background = C.item+"60"}>
                             <Avatar name={u.owner || "?"} size={24} />
                             <div style={{ flex:1, minWidth:0 }}>
                               <div style={{ fontWeight:"600", fontSize:"13px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{u.deviceName}</div>
@@ -1794,6 +1797,7 @@
                             {u.type && <Tag color={modelColor(u.type)}>{u.type}</Tag>}
                             {u.owner && <span style={{ fontSize:"12px", color:C.muted, whiteSpace:"nowrap" }}>{u.owner}</span>}
                             <span style={{ fontSize:"11px", color:"#555", whiteSpace:"nowrap" }}>Last seen: {u.lastSeen || "—"}</span>
+                            <span style={{ fontSize:"11px", color:C.muted }}>›</span>
                           </div>
                         ))}
                       </div>
