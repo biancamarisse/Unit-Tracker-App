@@ -583,9 +583,23 @@
         }, 600);
       };
 
-      const activeUnits = units.filter(u => !u.archived);
+      // Build owner→team lookup: stored teams + current user's session team
+      const ownerTeamLookup = React.useMemo(() => {
+        const map = {};
+        units.forEach(u => { if (u.owner && u.team) map[u.owner.toLowerCase()] = u.team; });
+        if (currentUser && currentTeam) map[currentUser.toLowerCase()] = currentTeam;
+        return map;
+      }, [units, currentUser, currentTeam]);
 
-      const rawFiltered = units.filter(u => {
+      // Resolve missing teams for every unit before display
+      const resolvedUnits = React.useMemo(() =>
+        units.map(u => ({ ...u, team: u.team || ownerTeamLookup[u.owner?.toLowerCase()] || "" })),
+        [units, ownerTeamLookup]
+      );
+
+      const activeUnits = resolvedUnits.filter(u => !u.archived);
+
+      const rawFiltered = resolvedUnits.filter(u => {
         if (!showArchived && u.archived) return false;
         if (search && !u.deviceName.toLowerCase().includes(search.toLowerCase()) && !u.serialNumber.toLowerCase().includes(search.toLowerCase())) return false;
         if (modelFilter    !== "all" && u.type     !== modelFilter)    return false;
@@ -659,11 +673,11 @@
           <div style={{ padding:"24px", maxWidth:"1000px", margin:"0 auto" }}>
             {tab === "connect" && <ConnectTab connecting={connecting} lastEvent={lastEvent} activity={activity} units={activeUnits} currentUser={currentUser} isReady={authState==="ready"} onSimulate={simulate} onDevicePaired={handleDevicePaired} onShowAll={showAllUnits} onReset={() => setLastEvent(null)} />}
             {tab === "units"   && <UnitsTab units={filtered} totalUnits={activeUnits} allOwners={allOwners} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} listFilter={listFilter} setListFilter={setListFilter} search={search} setSearch={setSearch} modelFilter={modelFilter} setModelFilter={setModelFilter} projectFilter={projectFilter} setProjectFilter={setProjectFilter} ownerFilter={ownerFilter} setOwnerFilter={setOwnerFilter} lastSeenFilter={lastSeenFilter} clearLastSeenFilter={() => setLastSeenFilter("")} showArchived={showArchived} setShowArchived={setShowArchived} sortOrder={sortOrder} setSortOrder={setSortOrder} onSelect={u => setSelectedUnit(u)} />}
-            {tab === "lists"   && <ListsTab lists={lists} units={units} onAdd={addList} onUpdate={updateList} onDelete={deleteList} onAddDevices={(name, id) => setAddToListModal({ listName: name, listId: id })} onSelect={u => setSelectedUnit(u)} />}
+            {tab === "lists"   && <ListsTab lists={lists} units={resolvedUnits} onAdd={addList} onUpdate={updateList} onDelete={deleteList} onAddDevices={(name, id) => setAddToListModal({ listName: name, listId: id })} onSelect={u => setSelectedUnit(u)} />}
           </div>
 
           {deviceModal  && <DeviceModal device={deviceModal} currentUser={currentUser} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} onRespond={handleOwnership} onClose={() => setDeviceModal(null)} />}
-          {selectedUnit && <UnitDetailModal unit={selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} currentTeam={currentTeam} currentUser={currentUser} customTeams={customTeams} allUnits={units} />}
+          {selectedUnit && <UnitDetailModal unit={resolvedUnits.find(u => u.id === selectedUnit.id) || selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} currentTeam={currentTeam} currentUser={currentUser} customTeams={customTeams} allUnits={resolvedUnits} />}
           {addToListModal && <AddToListModal listName={addToListModal.listName} units={units.filter(u => !u.archived)} onAddSelected={async (ids) => { for (const id of ids) { await handleUnitEdit(id, { list: addToListModal.listName }); } setAddToListModal(null); }} onConnectNew={() => handleConnectNewForList(addToListModal.listName)} onClose={() => setAddToListModal(null)} />}
           {showNamePrompt && <NamePromptModal
             extraTeams={customTeams}
