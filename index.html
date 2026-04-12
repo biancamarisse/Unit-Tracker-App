@@ -1329,7 +1329,7 @@
         return ownerTeamMap[ownerName.toLowerCase()] || "";
       };
 
-      const [editTeam, setEditTeam]           = useState(unit.team || currentTeam || "");
+      const [editTeam, setEditTeam]           = useState(unit.team || "");
       const [otherTeam, setOtherTeam]         = useState("");
       const [saving, setSaving]               = useState(false);
       const [addingModel, setAddingModel]     = useState(false);
@@ -1359,7 +1359,10 @@
       const handleSave = async () => {
         setSaving(true);
         const cleanLinks = editLinks.filter(l => l.url.trim());
-        await onEdit(unit.id, { deviceName: editName, firmwareVersion: editFw, type: editModel, project: editProject, list: editList, owner: editOwner, notes: editNotes, event: editEvent, links: cleanLinks, team: editTeam });
+        const ownerChanged = editOwner.trim() !== (unit.owner || "").trim();
+        // Team only updates when owner changes — otherwise preserve what's stored
+        const teamToSave = ownerChanged ? editTeam : unit.team;
+        await onEdit(unit.id, { deviceName: editName, firmwareVersion: editFw, type: editModel, project: editProject, list: editList, owner: editOwner, notes: editNotes, event: editEvent, links: cleanLinks, team: teamToSave });
         setSaving(false);
         setEditing(false);
         onClose();
@@ -1487,12 +1490,14 @@
                   </div>
 
                   {(() => {
-                    const ownerChanged = editOwner.trim() !== (unit.owner || "").trim();
-                    const needsTeam    = ownerChanged && !editTeam;
-                    const allTeams     = [...DEFAULT_TEAMS, ...customTeams.filter(t => !DEFAULT_TEAMS.includes(t))];
+                    const ownerChanged  = editOwner.trim() !== (unit.owner || "").trim();
+                    const nameParts     = editOwner.trim().split(/\s+/);
+                    const needsFullName = editOwner.trim() && nameParts.length < 2;
+                    const needsTeam     = ownerChanged && !editTeam;
+                    const allTeams      = [...DEFAULT_TEAMS, ...customTeams.filter(t => !DEFAULT_TEAMS.includes(t))];
                     return (
                       <div style={{ gridColumn:"1 / -1" }}>
-                        <div style={{ ...labelSty, marginBottom:"6px" }}>Owner</div>
+                        <div style={{ ...labelSty, marginBottom:"6px" }}>Owner <span style={{ color:C.orange }}>*</span> <span style={{ color:C.muted, fontWeight:"400", fontSize:"10px", textTransform:"none", letterSpacing:0 }}>First and last name required</span></div>
                         <input value={editOwner}
                           onChange={e => {
                             const name = e.target.value;
@@ -1500,7 +1505,10 @@
                             setEditTeam(resolveTeam(name));
                             setOtherTeam("");
                           }}
-                          placeholder="Name…" style={{ ...inputSty, borderColor: needsTeam ? C.orange+"80" : undefined }} />
+                          placeholder="First Last…" style={{ ...inputSty, borderColor: needsFullName ? "#ef444480" : needsTeam ? C.orange+"80" : undefined }} />
+                        {needsFullName && (
+                          <div style={{ fontSize:"11px", color:"#ef4444", marginTop:"4px" }}>Please enter both first and last name.</div>
+                        )}
 
                         {/* Team prompt — shown whenever owner has changed */}
                         {ownerChanged && (
@@ -1581,18 +1589,20 @@
                   </div>
 
                   {(() => {
-                    const ownerChanged = editOwner.trim() !== (unit.owner || "").trim();
-                    const canSave = !saving && !(ownerChanged && !editTeam);
+                    const ownerChanged  = editOwner.trim() !== (unit.owner || "").trim();
+                    const nameParts     = editOwner.trim().split(/\s+/);
+                    const needsFullName = editOwner.trim() && nameParts.length < 2;
+                    const canSave = !saving && !needsFullName && !(ownerChanged && !editTeam);
                     return (
                       <div style={{ marginTop:"4px" }}>
-                        {ownerChanged && !editTeam && (
+                        {ownerChanged && !editTeam && !needsFullName && (
                           <div style={{ fontSize:"12px", color:C.orange, marginBottom:"8px", display:"flex", alignItems:"center", gap:"6px" }}>
                             <span>⚠</span> Select a team for the new owner before saving.
                           </div>
                         )}
                         <div style={{ display:"flex", gap:"10px" }}>
                           <button onClick={handleSave} disabled={!canSave} style={{ ...btnOrange, flex:1, opacity:canSave?1:0.4 }}>{saving ? "Saving…" : "Save Changes"}</button>
-                          <button onClick={() => { setEditing(false); setEditName(unit.deviceName); setEditFw(unit.firmwareVersion); setEditModel(unit.type); setEditProject(unit.project||""); setEditList(unit.list||""); setEditOwner(unit.owner||""); setEditNotes(unit.notes||""); setEditEvent(unit.event||""); setEditLinks(Array.isArray(unit.links)?[...unit.links]:[]); setEditTeam(unit.team||currentTeam||""); setOtherTeam(""); }} style={{ ...btnGhost, flex:1 }}>Cancel</button>
+                          <button onClick={() => { setEditing(false); setEditName(unit.deviceName); setEditFw(unit.firmwareVersion); setEditModel(unit.type); setEditProject(unit.project||""); setEditList(unit.list||""); setEditOwner(unit.owner||""); setEditNotes(unit.notes||""); setEditEvent(unit.event||""); setEditLinks(Array.isArray(unit.links)?[...unit.links]:[]); setEditTeam(unit.team||""); setOtherTeam(""); }} style={{ ...btnGhost, flex:1 }}>Cancel</button>
                         </div>
                       </div>
                     );
@@ -1616,13 +1626,11 @@
                       <div style={{ fontSize:"14px", fontWeight:"600", marginTop:"5px", fontFamily:mono?"monospace":"inherit", color:orange?C.orange:C.text }}>{value||"—"}</div>
                     </div>
                   ))}
-                  {/* Team — read-only, tied to owner */}
+                  {/* Team — read-only, tied to owner; auto-resolves from known owners */}
                   <div>
                     <div style={labelSty}>Team</div>
                     <div style={{ marginTop:"5px" }}>
-                      {unit.team
-                        ? <Tag color={C.orange+"99"}>{unit.team}</Tag>
-                        : <span style={{ fontSize:"14px", color:"#444" }}>—</span>}
+                      {(() => { const t = unit.team || resolveTeam(unit.owner); return t ? <Tag color={C.orange+"99"}>{t}</Tag> : <span style={{ fontSize:"14px", color:"#444" }}>—</span>; })()}
                     </div>
                   </div>
                   {unit.event && (
