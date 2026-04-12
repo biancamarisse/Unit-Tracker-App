@@ -1,0 +1,1859 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Backbone Unit Tracker</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0c0c0e; color: #fff; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #111; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+    select option { background: #1e1e22; color: #fff; }
+    input::placeholder { color: #555; }
+    button:hover { opacity: 0.88; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  SETUP — paste your values here
+    //
+    //  SCRIPT_URL → the Web App URL from your Google Apps Script deployment
+    //  VENDOR_ID  → ask the firmware team for Backbone's USB Vendor ID
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const CONFIG = {
+      SCRIPT_URL: "https://script.google.com/a/macros/playbackbone.com/s/AKfycbxhvB8_uRD_p6YvfLAABSpsm9ByFJSIxYX-A8qDQD3iwhgHSM4fF0dhq8RmAhrYHxTcdQ/exec",
+      VENDOR_ID:  0x358A,
+    };
+
+    const IS_CONFIGURED = !CONFIG.SCRIPT_URL.startsWith("YOUR_");
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // APPS SCRIPT API  (no sign-in needed — runs as the sheet owner)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function scriptCall(params) {
+      return new Promise((resolve, reject) => {
+        const cbName = "__bb_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+        const url = new URL(CONFIG.SCRIPT_URL);
+        url.searchParams.set("callback", cbName);
+        Object.entries(params).forEach(([k, v]) => {
+          url.searchParams.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+        });
+
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error("Request timed out after 15s"));
+        }, 15000);
+
+        function cleanup() {
+          clearTimeout(timer);
+          delete window[cbName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+        }
+
+        window[cbName] = (data) => {
+          cleanup();
+          if (data && data.error) reject(new Error(data.error));
+          else resolve(data);
+        };
+
+        const script = document.createElement("script");
+        script.src = url.toString();
+        script.onerror = () => { cleanup(); reject(new Error("Could not reach Apps Script — check your SCRIPT_URL and deployment settings")); };
+        document.head.appendChild(script);
+      });
+    }
+
+    const initSheet      = ()                          => scriptCall({ action: "init" });
+    const loadUnits      = ()                          => scriptCall({ action: "getUnits" });
+    const loadTransfers  = (sn)                        => scriptCall({ action: "getTransfers", serialNumber: sn });
+    const loadHistory    = (sn)                        => scriptCall({ action: "getHistory",   serialNumber: sn });
+    const saveOwnership  = (unit, owner, fw, model, project, list) =>
+      scriptCall({ action: "saveOwnership", unit, newOwner: owner, fw: fw||"", model: model||"", project: project||"", list: list||"" });
+    const saveTransfer   = (sn, dn, prev, next, act)   =>
+      scriptCall({ action: "saveTransfer", serialNumber: sn, deviceName: dn, prevOwner: prev||"", newOwner: next, transferAction: act });
+    const saveHistoryCall = (sn, dn, entries) =>
+      scriptCall({ action: "saveHistory", serialNumber: sn, deviceName: dn, entries });
+    const saveFirmwareOnly = (unitId, fw)              => scriptCall({ action: "saveFirmwareOnly", unitId, fw });
+    const updateUnit     = (unitId, changes)           => scriptCall({ action: "updateUnit", unitId, changes });
+    const deleteUnitApi  = (unitId)                    => scriptCall({ action: "deleteUnit", unitId });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // WEBUSBDETECTION
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function listenForUSB(onConnect) {
+      if (!navigator.usb) return () => {};
+      const handler = (event) => {
+        const d = event.device;
+        onConnect({
+          id:              d.serialNumber || String(Date.now()),
+          deviceName:      d.productName  || "Unknown Backbone Device",
+          serialNumber:    d.serialNumber || "UNKNOWN",
+          firmwareVersion: "",
+          type:            "Unknown",
+        });
+      };
+      navigator.usb.addEventListener("connect", handler);
+      return () => navigator.usb.removeEventListener("connect", handler);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STYLES & CONSTANTS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const C = {
+      orange: "#f47b20", bg: "#0c0c0e", card: "#161618",
+      item: "#1e1e22", border: "#2a2a30", text: "#ffffff",
+      muted: "#888896", green: "#22c55e", blue: "#60a5fa",
+    };
+
+    const DEFAULT_MODELS   = ["EVT", "DVT", "PVT", "Proto 1", "Clickable"];
+    const DEFAULT_PROJECTS = ["Tori", "Niji", "Kiri", "Hakone", "Hachi"];
+    const DEFAULT_EVENTS   = ["Sent to partner", "Sent to participant", "Sent for drop testing", "Sent for compliance testing"];
+
+    const MODEL_COLORS = {
+      "EVT":       "#f47b20",
+      "DVT":       "#60a5fa",
+      "PVT":       "#34d399",
+      "Proto 1":   "#a78bfa",
+      "Clickable": "#fbbf24",
+    };
+
+    const PROJECT_COLORS = {
+      "Tori":   "#a78bfa",
+      "Niji":   "#34d399",
+      "Kiri":   "#f9a8d4",
+      "Hakone": "#fbbf24",
+      "Hachi":  "#60a5fa",
+    };
+
+    function modelColor(m)   { return MODEL_COLORS[m]   || "#888896"; }
+    function projectColor(p) { return PROJECT_COLORS[p] || "#888896"; }
+
+    const LIST_COLORS = ["#f47b20","#60a5fa","#34d399","#a78bfa","#fbbf24","#f9a8d4","#f87171","#818cf8","#fb923c","#2dd4bf"];
+    function listColor(name, lists) {
+      const idx = (lists || []).findIndex(l => l.name === name);
+      return idx >= 0 ? LIST_COLORS[idx % LIST_COLORS.length] : "#888896";
+    }
+
+    const cardSty   = { background: C.card, border: `1px solid ${C.border}`, borderRadius: "12px", padding: "20px" };
+    const inputSty  = { background: C.item, border: `1px solid ${C.border}`, borderRadius: "8px", color: C.text, padding: "9px 13px", fontSize: "14px", outline: "none", width: "100%", boxSizing: "border-box" };
+    const selectSty = { background: C.item, border: `1px solid ${C.border}`, borderRadius: "8px", color: C.text, padding: "9px 13px", fontSize: "14px", cursor: "pointer", outline: "none" };
+    const labelSty  = { fontSize: "11px", color: C.muted, fontWeight: "600", letterSpacing: "0.7px", textTransform: "uppercase" };
+    const btnOrange = { background: C.orange, border: "none", borderRadius: "9px", color: "#fff", fontWeight: "700", fontSize: "14px", padding: "11px 20px", cursor: "pointer" };
+    const btnGhost  = { background: C.item, border: `1px solid ${C.border}`, borderRadius: "9px", color: C.text, fontWeight: "600", fontSize: "14px", padding: "11px 20px", cursor: "pointer" };
+    const btnSmall  = { background: C.item, border: `1px solid ${C.border}`, borderRadius: "7px", color: C.text, fontWeight: "600", fontSize: "13px", padding: "7px 14px", cursor: "pointer" };
+
+    const Tag = ({ color, children }) => (
+      <span style={{ display:"inline-block", padding:"3px 9px", borderRadius:"20px", fontSize:"11px", fontWeight:"600", background:color+"22", color, whiteSpace:"nowrap" }}>{children}</span>
+    );
+
+    const Avatar = ({ name = "?", size = 28 }) => (
+      <div style={{ width:size, height:size, borderRadius:"50%", background:C.orange+"30", color:C.orange, display:"flex", alignItems:"center", justifyContent:"center", fontSize:size*0.36, fontWeight:"700", flexShrink:0 }}>
+        {name.split(" ").map(n=>n[0]).join("").toUpperCase().slice(0,2)}
+      </div>
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // NAME PROMPT MODAL
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function NamePromptModal({ onSave }) {
+      const [name, setName] = useState("");
+      const submit = () => { const n = name.trim(); if (n) onSave(n); };
+      return (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", backdropFilter:"blur(12px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:300, padding:"20px" }}>
+          <div style={{ background:"#17171b", border:`1px solid ${C.border}`, borderRadius:"20px", width:"100%", maxWidth:"380px", padding:"32px 28px", boxShadow:"0 32px 100px rgba(0,0,0,0.8)", textAlign:"center" }}>
+            {/* Backbone logo */}
+            <div style={{ width:"52px", height:"52px", background:C.orange, borderRadius:"14px", display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"900", fontSize:"26px", margin:"0 auto 20px" }}>B</div>
+            <div style={{ fontWeight:"700", fontSize:"20px", marginBottom:"8px" }}>Welcome to Unit Tracker</div>
+            <div style={{ color:C.muted, fontSize:"14px", lineHeight:"1.65", marginBottom:"28px" }}>
+              Enter your name once and it'll be remembered every time you open the app.
+            </div>
+            <input
+              autoFocus
+              value={name}
+              onChange={e => setName(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && submit()}
+              placeholder="Your name…"
+              style={{ ...inputSty, textAlign:"center", fontSize:"16px", padding:"12px 16px", marginBottom:"14px" }}
+            />
+            <button
+              onClick={submit}
+              disabled={!name.trim()}
+              style={{ ...btnOrange, width:"100%", fontSize:"15px", padding:"13px", opacity: name.trim() ? 1 : 0.45 }}
+            >
+              Let's go →
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SETUP SCREEN
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function SetupScreen() {
+      const steps = [
+        { n:"1", title:"Open your Google Sheet", body:"Go to sheets.google.com and open (or create) the spreadsheet you want to use. The app will create the Units and Transfers tabs automatically." },
+        { n:"2", title:"Create the Apps Script", body:"In your Google Sheet, click Extensions → Apps Script. Delete any existing code, paste in the full contents of Code.gs, then save (Cmd+S or Ctrl+S)." },
+        { n:"3", title:"Deploy as a web app", body:'Click Deploy → New deployment → select type "Web app" → set Execute as: Me → Who has access: Anyone → click Deploy → copy the Web app URL.' },
+        { n:"4", title:"Paste the URL here", body:"Open unit-tracker.html in VS Code, find the CONFIG block near the top, paste your Web app URL as SCRIPT_URL, and save." },
+      ];
+      return (
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", padding:"24px" }}>
+          <div style={{ ...cardSty, maxWidth:"540px", width:"100%" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:"12px", marginBottom:"28px" }}>
+              <div style={{ width:"36px", height:"36px", background:C.orange, borderRadius:"9px", display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"900", fontSize:"18px" }}>B</div>
+              <div>
+                <div style={{ fontWeight:"700", fontSize:"18px" }}>Backbone Unit Tracker</div>
+                <div style={{ color:C.muted, fontSize:"13px" }}>One-time setup needed</div>
+              </div>
+            </div>
+            {steps.map(({ n, title, body }) => (
+              <div key={n} style={{ display:"flex", gap:"14px", marginBottom:"22px" }}>
+                <div style={{ width:"28px", height:"28px", borderRadius:"50%", background:C.orange+"25", color:C.orange, display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"700", fontSize:"13px", flexShrink:0 }}>{n}</div>
+                <div>
+                  <div style={{ fontWeight:"600", fontSize:"14px", marginBottom:"4px" }}>{title}</div>
+                  <div style={{ color:C.muted, fontSize:"13px", lineHeight:"1.65" }}>{body}</div>
+                </div>
+              </div>
+            ))}
+            <div style={{ background:C.item, borderRadius:"8px", padding:"14px 16px", fontFamily:"monospace", fontSize:"13px", color:"#f9a8d4", lineHeight:"1.8" }}>
+              const CONFIG = {'{'}<br/>
+              &nbsp;&nbsp;SCRIPT_URL: "<span style={{color:"#fcd34d"}}>paste-your-web-app-url-here</span>",<br/>
+              &nbsp;&nbsp;VENDOR_ID:&nbsp; <span style={{color:"#86efac"}}>0x0000</span>,<br/>
+              {'}'};
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MAIN APP
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function App() {
+      // "loading" | "ready" | "error"
+      const [authState, setAuthState]           = useState("loading");
+      const [units, setUnits]                   = useState([]);
+      const [currentUser, setCurrentUser]       = useState(() => localStorage.getItem("bb_tracker_user") || "");
+      const [showNamePrompt, setShowNamePrompt] = useState(() => !localStorage.getItem("bb_tracker_user"));
+      const [nameEditMode, setNameEditMode]     = useState(false);
+      const [customModels, setCustomModels]     = useState(() => {
+        try { return JSON.parse(localStorage.getItem("bb_custom_models") || "[]"); } catch { return []; }
+      });
+      const [customProjects, setCustomProjects] = useState(() => {
+        try { return JSON.parse(localStorage.getItem("bb_custom_projects") || "[]"); } catch { return []; }
+      });
+      const [customEvents, setCustomEvents]     = useState(() => {
+        try { return JSON.parse(localStorage.getItem("bb_custom_events") || "[]"); } catch { return []; }
+      });
+      const [tab, setTab]                       = useState("connect");
+      const [deviceModal, setDeviceModal]       = useState(null);
+      const [selectedUnit, setSelectedUnit]     = useState(null);
+      const [connecting, setConnecting]         = useState(false);
+      const [lastEvent, setLastEvent]           = useState(null);
+      const [activity, setActivity]             = useState([]);
+      const [syncing, setSyncing]               = useState(false);
+      const [error, setError]                   = useState(null);
+      const [search, setSearch]                 = useState("");
+      const [modelFilter, setModelFilter]       = useState("all");
+      const [projectFilter, setProjectFilter]   = useState("all");
+      const [ownerFilter, setOwnerFilter]       = useState("all");
+      const [lastSeenFilter, setLastSeenFilter] = useState("");
+      const [showArchived, setShowArchived]     = useState(false);
+      const [sortOrder, setSortOrder]           = useState("newest");
+      const [lists, setLists]                   = useState(() => {
+        try { return JSON.parse(localStorage.getItem("bb_lists") || "[]"); } catch { return []; }
+      });
+      const [listFilter, setListFilter]         = useState("all");
+      const [addToListModal, setAddToListModal] = useState(null); // { listName, listId }
+
+      // All models / projects / events = defaults + any custom ones added in the app
+      const allModels   = [...DEFAULT_MODELS,   ...customModels.filter(m => !DEFAULT_MODELS.includes(m))];
+      const allProjects = [...DEFAULT_PROJECTS, ...customProjects.filter(p => !DEFAULT_PROJECTS.includes(p))];
+      const allEvents   = [...DEFAULT_EVENTS,   ...customEvents.filter(e => !DEFAULT_EVENTS.includes(e))];
+
+      const addModel = (name) => {
+        const trimmed = name.trim();
+        if (!trimmed || allModels.includes(trimmed)) return;
+        const updated = [...customModels, trimmed];
+        setCustomModels(updated);
+        localStorage.setItem("bb_custom_models", JSON.stringify(updated));
+      };
+
+      const addProject = (name) => {
+        const trimmed = name.trim();
+        if (!trimmed || allProjects.includes(trimmed)) return;
+        const updated = [...customProjects, trimmed];
+        setCustomProjects(updated);
+        localStorage.setItem("bb_custom_projects", JSON.stringify(updated));
+      };
+      const addEvent = (name) => {
+        const trimmed = name.trim();
+        if (!trimmed || allEvents.includes(trimmed)) return;
+        const updated = [...customEvents, trimmed];
+        setCustomEvents(updated);
+        localStorage.setItem("bb_custom_events", JSON.stringify(updated));
+      };
+
+      const addList = (name) => {
+        const trimmed = name.trim();
+        if (!trimmed || lists.some(l => l.name === trimmed)) return;
+        const newList = { id: Date.now().toString(), name: trimmed, archived: false };
+        const updated = [...lists, newList];
+        setLists(updated);
+        localStorage.setItem("bb_lists", JSON.stringify(updated));
+      };
+      const updateList = (id, changes) => {
+        const updated = lists.map(l => l.id === id ? { ...l, ...changes } : l);
+        setLists(updated);
+        localStorage.setItem("bb_lists", JSON.stringify(updated));
+      };
+      const deleteList = (id) => {
+        const updated = lists.filter(l => l.id !== id);
+        setLists(updated);
+        localStorage.setItem("bb_lists", JSON.stringify(updated));
+      };
+
+      useEffect(() => {
+        if (!IS_CONFIGURED) return;
+        setAuthState("loading");
+        initSheet()
+          .then(() => loadUnits())
+          .then(data => { setUnits(data); setAuthState("ready"); })
+          .catch(e => { setError("Could not connect: " + e.message); setAuthState("error"); });
+      }, []);
+
+      useEffect(() => {
+        const cleanup = listenForUSB((deviceData) => {
+          setConnecting(true);
+          setTimeout(async () => {
+            setConnecting(false);
+            let currentOwner = "Unregistered", lastSeen = "Never", isNew = true;
+            if (IS_CONFIGURED) {
+              try {
+                const all = await loadUnits();
+                const existing = all.find(u => u.serialNumber === deviceData.serialNumber);
+                if (existing) { currentOwner = existing.owner; lastSeen = existing.lastSeen; isNew = false; }
+              } catch (_) {}
+            }
+            setDeviceModal({ ...deviceData, currentOwner, lastSeen, isNew });
+          }, 900);
+        });
+        return cleanup;
+      }, []);
+
+      const refresh = async () => {
+        if (!IS_CONFIGURED) return;
+        setSyncing(true);
+        try { setUnits(await loadUnits()); }
+        catch (e) { setError("Refresh failed: " + e.message); }
+        finally { setSyncing(false); }
+      };
+
+      const simulate = (deviceData) => {
+        setConnecting(true);
+        setTimeout(() => {
+          setConnecting(false);
+          const existing = units.find(u => u.serialNumber === deviceData.serialNumber);
+          setDeviceModal({ ...deviceData, currentOwner: existing?.owner || "Unregistered", lastSeen: existing?.lastSeen || "Never", isNew: !existing });
+        }, 1500);
+      };
+
+      const handleOwnership = async (takeOwnership, fw, model, project, list) => {
+        if (!deviceModal) return;
+        const dm = deviceModal;
+        // ← modal stays open; DeviceModal shows its own loading state while we work
+        const today = new Date().toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" });
+        const owner = currentUser.trim() || "Unknown";
+
+        if (takeOwnership) {
+          if (IS_CONFIGURED) {
+            setSyncing(true);
+            try {
+              await saveOwnership(dm, owner, fw, model, project, list);
+              await saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, owner, "ownership_change");
+              await refresh();
+            } catch (e) { setError("Save failed: " + e.message); }
+            finally { setSyncing(false); }
+          } else {
+            setUnits(prev => {
+              const exists = prev.find(u => u.serialNumber === dm.serialNumber);
+              if (exists) return prev.map(u => u.serialNumber===dm.serialNumber ? {...u, owner, lastSeen:today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{})} : u);
+              return [...prev, { id:dm.id, deviceName:dm.deviceName, serialNumber:dm.serialNumber, firmwareVersion:fw||dm.firmwareVersion, type:model||dm.type, project:project||dm.project||"", list:list||dm.list||"", owner, lastSeen:today }];
+            });
+          }
+          setLastEvent({ type:"ownership", device:dm.deviceName, owner });
+          setActivity(p => [{ icon:"👤", text:`${owner} took ownership of ${dm.deviceName}`, time:"Just now" }, ...p.slice(0,4)]);
+        } else {
+          if (IS_CONFIGURED) {
+            try {
+              await Promise.all([
+                saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, dm.currentOwner, "check_in"),
+                updateUnit(dm.id, { lastSeen: today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{}) }),
+              ]);
+              await refresh();
+            } catch (_) {}
+          } else {
+            setUnits(prev => prev.map(u => u.serialNumber===dm.serialNumber ? {...u, lastSeen:today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{})} : u));
+          }
+          setLastEvent({ type:"check", device:dm.deviceName });
+          setActivity(p => [{ icon:"🔍", text:`Checked ${dm.deviceName} — no change`, time:"Just now" }, ...p.slice(0,4)]);
+        }
+
+        setDeviceModal(null); // close modal only after everything is saved
+      };
+
+      const FIELD_LABELS = { deviceName:"Device Name", firmwareVersion:"Firmware", type:"Type", project:"Project", list:"List", owner:"Owner", notes:"Notes", lastSeen:"Last Seen", archived:"Archived", links:"Links", event:"Event" };
+
+      const handleUnitEdit = async (unitId, changes) => {
+        const currentUnit = units.find(u => u.id === unitId);
+        // Log owner reassignment to session activity
+        if (currentUnit && changes.owner !== undefined && changes.owner !== currentUnit.owner) {
+          const newOwner = changes.owner || "Unassigned";
+          setActivity(p => [{
+            icon: "🔄",
+            text: `${currentUnit.deviceName} reassigned to ${newOwner}`,
+            time: "Just now",
+          }, ...p.slice(0, 4)]);
+        }
+        if (IS_CONFIGURED) {
+          setSyncing(true);
+          try {
+            if (currentUnit) {
+              const entries = Object.keys(changes)
+                .filter(k => String(changes[k] ?? "") !== String(currentUnit[k] ?? ""))
+                .map(k => ({ field: FIELD_LABELS[k] || k, oldValue: String(currentUnit[k] ?? ""), newValue: String(changes[k] ?? "") }));
+              if (entries.length > 0) {
+                saveHistoryCall(currentUnit.serialNumber, currentUnit.deviceName, entries).catch(() => {});
+              }
+            }
+            await updateUnit(unitId, changes);
+            await refresh();
+          } catch (e) { setError("Save failed: " + e.message); }
+          finally { setSyncing(false); }
+        } else {
+          setUnits(prev => prev.map(u => u.id === unitId ? { ...u, ...changes } : u));
+        }
+      };
+
+      const handleUnitDelete = async (unitId) => {
+        if (IS_CONFIGURED) {
+          setSyncing(true);
+          try {
+            await deleteUnitApi(unitId);
+            await refresh();
+          } catch (e) { setError("Delete failed: " + e.message); }
+          finally { setSyncing(false); }
+        } else {
+          setUnits(prev => prev.filter(u => u.id !== unitId));
+        }
+      };
+
+      const handleConnectNewForList = async (listName) => {
+        setAddToListModal(null);
+        if (!navigator.usb) { setError("WebUSB not supported — use Chrome on desktop."); return; }
+        try {
+          const device = await navigator.usb.requestDevice({ filters: [] });
+          handleDevicePaired(device, listName);
+        } catch (e) {
+          if (e.name !== "NotFoundError") setError(e.message);
+        }
+      };
+
+      const todayStr = new Date().toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" });
+
+      const showAllUnits = () => {
+        setSearch(""); setModelFilter("all"); setProjectFilter("all");
+        setOwnerFilter("all"); setLastSeenFilter(""); setListFilter("all");
+        setTab("units");
+      };
+      const showMyUnits = () => {
+        setSearch(""); setModelFilter("all"); setProjectFilter("all");
+        setOwnerFilter(currentUser || "all"); setLastSeenFilter(""); setListFilter("all");
+        setTab("units");
+      };
+      const showTodayUnits = () => {
+        setSearch(""); setModelFilter("all"); setProjectFilter("all");
+        setOwnerFilter("all"); setLastSeenFilter(todayStr); setListFilter("all");
+        setTab("units");
+      };
+
+      // Called immediately after a device is paired via requestDevice()
+      // so the modal appears without needing to unplug and replug
+      const handleDevicePaired = async (usbDevice, defaultList = "") => {
+        const deviceData = {
+          id:              usbDevice.serialNumber || String(Date.now()),
+          deviceName:      usbDevice.productName  || "Unknown Backbone Device",
+          serialNumber:    usbDevice.serialNumber  || "UNKNOWN",
+          firmwareVersion: "",
+          type:            "",
+          project:         "",
+        };
+        setConnecting(true);
+        setTimeout(async () => {
+          setConnecting(false);
+          let currentOwner = "Unregistered", lastSeen = "Never", isNew = true;
+          if (IS_CONFIGURED) {
+            try {
+              const all = await loadUnits();
+              const existing = all.find(u => u.serialNumber === deviceData.serialNumber);
+              if (existing) { currentOwner = existing.owner; lastSeen = existing.lastSeen; isNew = false; }
+            } catch (_) {}
+          }
+          setDeviceModal({ ...deviceData, currentOwner, lastSeen, isNew, list: defaultList });
+        }, 600);
+      };
+
+      const activeUnits = units.filter(u => !u.archived);
+
+      const rawFiltered = units.filter(u => {
+        if (!showArchived && u.archived) return false;
+        if (search && !u.deviceName.toLowerCase().includes(search.toLowerCase()) && !u.serialNumber.toLowerCase().includes(search.toLowerCase())) return false;
+        if (modelFilter    !== "all" && u.type     !== modelFilter)    return false;
+        if (projectFilter  !== "all" && u.project  !== projectFilter)  return false;
+        if (ownerFilter    !== "all" && u.owner    !== ownerFilter)    return false;
+        if (listFilter     !== "all" && u.list     !== listFilter)     return false;
+        if (lastSeenFilter && u.lastSeen !== lastSeenFilter)           return false;
+        return true;
+      });
+
+      const parseDate = (s) => (s && s !== "Never") ? new Date(s) : null;
+      const filtered = [...rawFiltered].sort((a, b) => {
+        const da = parseDate(a.lastSeen), db = parseDate(b.lastSeen);
+        if (!da && !db) return 0;
+        if (!da) return 1;
+        if (!db) return -1;
+        return sortOrder === "newest" ? db - da : da - db;
+      });
+
+      const allOwners = [...new Set(activeUnits.map(u => u.owner))].filter(Boolean).sort();
+
+      if (!IS_CONFIGURED) return <SetupScreen />;
+
+      return (
+        <div style={{ background:C.bg, minHeight:"100vh" }}>
+
+          <header style={{ background:"#111114", borderBottom:`1px solid ${C.border}`, padding:"0 24px", display:"flex", alignItems:"center", justifyContent:"space-between", height:"56px", position:"sticky", top:0, zIndex:50 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:"10px" }}>
+              <div style={{ width:"28px", height:"28px", background:C.orange, borderRadius:"7px", display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"900", fontSize:"14px" }}>B</div>
+              <span style={{ fontWeight:"700", fontSize:"15px" }}>Backbone</span>
+              <span style={{ color:"#3a3a42", fontSize:"18px" }}>›</span>
+              <span style={{ color:"#999", fontSize:"14px" }}>Unit Tracker</span>
+            </div>
+            <div style={{ display:"flex", alignItems:"center", gap:"10px" }}>
+              {authState === "loading" && <span style={{ color:C.muted, fontSize:"13px" }}>Connecting…</span>}
+              {authState === "ready"   && <div style={{ width:"7px", height:"7px", background:C.green, borderRadius:"50%" }} />}
+              {authState === "error"   && <button onClick={() => { setError(null); setAuthState("loading"); initSheet().then(()=>loadUnits()).then(d=>{setUnits(d);setAuthState("ready");}).catch(e=>{setError(e.message);setAuthState("error");}); }} style={{ ...btnOrange, padding:"5px 12px", fontSize:"12px" }}>Retry</button>}
+              {nameEditMode ? (
+                <div style={{ display:"flex", gap:"6px", alignItems:"center" }}>
+                  <input
+                    autoFocus
+                    value={currentUser}
+                    onChange={e => { setCurrentUser(e.target.value); localStorage.setItem("bb_tracker_user", e.target.value); }}
+                    onKeyDown={e => { if (e.key === "Enter" || e.key === "Escape") setNameEditMode(false); }}
+                    onBlur={() => setNameEditMode(false)}
+                    placeholder="Your name…"
+                    style={{ ...inputSty, width:"150px", padding:"5px 10px", fontSize:"13px" }}
+                  />
+                </div>
+              ) : (
+                <button
+                  onClick={() => { if (currentUser) setNameEditMode(true); else setShowNamePrompt(true); }}
+                  style={{ display:"flex", alignItems:"center", gap:"8px", background:"none", border:`1px solid ${C.border}`, borderRadius:"20px", color:C.text, cursor:"pointer", padding:"4px 10px 4px 4px", transition:"border-color 0.15s" }}
+                  title="Click to change name"
+                >
+                  <Avatar name={currentUser || "?"} size={26} />
+                  <span style={{ fontSize:"13px", fontWeight: currentUser ? "600" : "400", color: currentUser ? C.text : C.muted }}>
+                    {currentUser || "Set your name"}
+                  </span>
+                </button>
+              )}
+            </div>
+          </header>
+
+          <div style={{ background:"#111114", borderBottom:`1px solid ${C.border}`, padding:"0 24px", display:"flex", alignItems:"center" }}>
+            {[{ key:"connect", label:"Connect Device" }, { key:"units", label:`All Units (${units.length})` }, { key:"lists", label:`Lists (${lists.filter(l=>!l.archived).length})` }].map(t => (
+              <button key={t.key} onClick={() => setTab(t.key)} style={{ background:"none", border:"none", cursor:"pointer", borderBottom:tab===t.key?`2px solid ${C.orange}`:"2px solid transparent", color:tab===t.key?C.text:C.muted, padding:"13px 20px", fontSize:"14px", fontWeight:tab===t.key?"600":"400" }}>
+                {t.label}
+              </button>
+            ))}
+            {syncing && <span style={{ color:C.muted, fontSize:"12px", marginLeft:"8px" }}>Syncing…</span>}
+            {IS_CONFIGURED && <button onClick={refresh} style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:"13px", marginLeft:"auto", padding:"0 4px" }}>⟳ Refresh</button>}
+          </div>
+
+          {error && (
+            <div style={{ background:"#ff3b3b18", border:"1px solid #ff3b3b40", borderRadius:"8px", padding:"10px 16px", margin:"14px 24px", color:"#ff7070", fontSize:"13px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+              {error}
+              <button onClick={() => setError(null)} style={{ background:"none", border:"none", color:"#ff7070", cursor:"pointer", fontSize:"16px" }}>×</button>
+            </div>
+          )}
+
+          <div style={{ padding:"24px", maxWidth:"1000px", margin:"0 auto" }}>
+            {tab === "connect" && <ConnectTab connecting={connecting} lastEvent={lastEvent} activity={activity} units={activeUnits} currentUser={currentUser} isReady={authState==="ready"} onSimulate={simulate} onDevicePaired={handleDevicePaired} onShowAll={showAllUnits} onReset={() => setLastEvent(null)} />}
+            {tab === "units"   && <UnitsTab units={filtered} totalUnits={activeUnits} allOwners={allOwners} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} listFilter={listFilter} setListFilter={setListFilter} search={search} setSearch={setSearch} modelFilter={modelFilter} setModelFilter={setModelFilter} projectFilter={projectFilter} setProjectFilter={setProjectFilter} ownerFilter={ownerFilter} setOwnerFilter={setOwnerFilter} lastSeenFilter={lastSeenFilter} clearLastSeenFilter={() => setLastSeenFilter("")} showArchived={showArchived} setShowArchived={setShowArchived} sortOrder={sortOrder} setSortOrder={setSortOrder} onSelect={u => setSelectedUnit(u)} />}
+            {tab === "lists"   && <ListsTab lists={lists} units={units} onAdd={addList} onUpdate={updateList} onDelete={deleteList} onAddDevices={(name, id) => setAddToListModal({ listName: name, listId: id })} />}
+          </div>
+
+          {deviceModal  && <DeviceModal device={deviceModal} currentUser={currentUser} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} onRespond={handleOwnership} onClose={() => setDeviceModal(null)} />}
+          {selectedUnit && <UnitDetailModal unit={selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} />}
+          {addToListModal && <AddToListModal listName={addToListModal.listName} units={units.filter(u => !u.archived)} onAddSelected={async (ids) => { for (const id of ids) { await handleUnitEdit(id, { list: addToListModal.listName }); } setAddToListModal(null); }} onConnectNew={() => handleConnectNewForList(addToListModal.listName)} onClose={() => setAddToListModal(null)} />}
+          {showNamePrompt && <NamePromptModal onSave={(name) => { setCurrentUser(name); localStorage.setItem("bb_tracker_user", name); setShowNamePrompt(false); }} />}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CONNECT TAB
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function StatCard({ label, value, color, onClick, enabled, active }) {
+      const [hov, setHov] = React.useState(false);
+      const clickable = enabled && onClick;
+      return (
+        <div
+          onClick={clickable ? onClick : undefined}
+          onMouseEnter={() => setHov(true)}
+          onMouseLeave={() => setHov(false)}
+          style={{ ...cardSty, padding:"14px 16px", textAlign:"center", cursor:clickable?"pointer":"default",
+            background: active ? C.orange+"12" : hov && clickable ? C.item : C.card,
+            borderColor: active ? C.orange+"90" : hov && clickable ? C.orange+"60" : C.border,
+            transition:"background 0.15s, border-color 0.15s" }}>
+          <div style={{ fontSize:"26px", fontWeight:"700", color, lineHeight:1 }}>{value}</div>
+          <div style={{ color:C.muted, fontSize:"12px", marginTop:"5px" }}>{label}</div>
+          {clickable && <div style={{ fontSize:"10px", color:C.orange, marginTop:"4px", opacity: (hov || active) ? 1 : 0, transition:"opacity 0.15s" }}>{active ? "▲ Close" : "▼ View"}</div>}
+        </div>
+      );
+    }
+
+    function BackboneIllustration({ pulsing = false }) {
+      const ac  = "#f47b20";
+      const sc  = pulsing ? ac : "#2a2a38";        // stroke color
+      const gf  = "#181820";                        // grip fill
+      const bf  = pulsing ? "#30303e" : "#242430";  // button fill
+      const cc  = pulsing ? ac+"99" : "#252532";    // cable color
+
+      return (
+        <svg width="280" height="192" viewBox="0 0 280 192" style={{ overflow:"visible" }}>
+          {pulsing && (
+            <style>{`
+              @keyframes bb-glow   { 0%,100%{opacity:.04} 50%{opacity:.13} }
+              @keyframes bb-pulse  { 0%,100%{opacity:.25} 50%{opacity:1}   }
+              .bb-glow  { animation: bb-glow  2s   ease-in-out infinite }
+              .bb-p0    { animation: bb-pulse 1.5s ease-in-out 0s   infinite }
+              .bb-p1    { animation: bb-pulse 1.5s ease-in-out .35s infinite }
+              .bb-p2    { animation: bb-pulse 1.5s ease-in-out .7s  infinite }
+            `}</style>
+          )}
+
+          {/* Ambient glow */}
+          {pulsing && <ellipse cx="140" cy="62" rx="118" ry="50" fill={ac} className="bb-glow"/>}
+
+          {/* ═══ LEFT GRIP ═══ */}
+          {/* Shoulder / trigger */}
+          <rect x="2"  y="4"  width="90" height="16" rx="8"  fill={gf} stroke={sc} strokeWidth="1.3"/>
+          {/* Main grip body — pill */}
+          <rect x="2"  y="16" width="90" height="96" rx="40" fill={gf} stroke={sc} strokeWidth="1.5"/>
+
+          {/* Left analog stick — top of grip */}
+          <circle cx="47" cy="42" r="20" fill="#111118" stroke="#1e1e28" strokeWidth="2"/>
+          <circle cx="47" cy="42" r="15" fill="#181824"/>
+          <circle cx="47" cy="42" r="7"  fill={bf}/>
+
+          {/* D-pad */}
+          <rect x="29" y="76" width="36" height="12" rx="5" fill={bf}/>
+          <rect x="41" y="64" width="12" height="36" rx="5" fill={bf}/>
+          <circle cx="47" cy="82" r="5" fill={pulsing ? "#222230" : "#1c1c26"}/>
+
+          {/* ··· button */}
+          <circle cx="28"  cy="104" r="5.5" fill={bf}/>
+          {[-3,0,3].map(x => <circle key={x} cx={28+x} cy="104" r="1.2" fill="#555" />)}
+
+          {/* Capture / screenshot button */}
+          <circle cx="48" cy="106" r="5.5" fill={bf}/>
+          <rect x="44.5" y="103" width="7" height="6" rx="1.2" fill="none" stroke="#555" strokeWidth="1"/>
+          <rect x="46"   y="102" width="4" height="2.5" rx="0.8" fill={bf} stroke="#555" strokeWidth="0.8"/>
+
+          {/* ═══ CENTER BRIDGE ═══ */}
+          <rect x="87" y="32" width="106" height="62" rx="10" fill="#1c1c26" stroke={sc} strokeWidth="1.5"/>
+
+          {/* Dot texture */}
+          {[0,1,2,3].flatMap(row => [0,1,2,3,4,5,6].map(col => (
+            <circle key={`${row}-${col}`} cx={96 + col*13} cy={43 + row*12} r="1.4" fill="#28283a"/>
+          )))}
+
+          {/* BACKBONE wordmark */}
+          <text x="140" y="82" textAnchor="middle" fill={pulsing ? ac+"55" : "#32323e"}
+                fontSize="7.5" fontWeight="700" letterSpacing="3"
+                fontFamily="'Inter', system-ui, sans-serif">BACKBONE</text>
+
+          {/* USB-C port in bridge bottom */}
+          <rect x="131" y="87" width="18" height="6"  rx="3" fill={pulsing ? ac : "#2c2c3c"}/>
+          <rect x="135" y="88" width="10" height="4"  rx="2" fill="#0c0c14"/>
+
+          {/* ═══ RIGHT GRIP ═══ */}
+          {/* Shoulder / trigger */}
+          <rect x="188" y="4"  width="90" height="16" rx="8"  fill={gf} stroke={sc} strokeWidth="1.3"/>
+          {/* Main grip body — pill */}
+          <rect x="188" y="16" width="90" height="96" rx="40" fill={gf} stroke={sc} strokeWidth="1.5"/>
+
+          {/* ABXY — diamond layout (Y top, X left, B right, A bottom) */}
+          <circle cx="233" cy="40" r="10" fill={bf}/><text x="233" y="44.5" textAnchor="middle" fill="#5a5a6a" fontSize="9.5" fontWeight="700">Y</text>
+          <circle cx="220" cy="54" r="10" fill={bf}/><text x="220" y="58.5" textAnchor="middle" fill="#5a5a6a" fontSize="9.5" fontWeight="700">X</text>
+          <circle cx="246" cy="54" r="10" fill={bf}/><text x="246" y="58.5" textAnchor="middle" fill="#5a5a6a" fontSize="9.5" fontWeight="700">B</text>
+          <circle cx="233" cy="68" r="10" fill={bf}/><text x="233" y="72.5" textAnchor="middle" fill="#5a5a6a" fontSize="9.5" fontWeight="700">A</text>
+
+          {/* Right analog stick — lower area */}
+          <circle cx="233" cy="94" r="20" fill="#111118" stroke="#1e1e28" strokeWidth="2"/>
+          <circle cx="233" cy="94" r="15" fill="#181824"/>
+          <circle cx="233" cy="94" r="7"  fill={bf}/>
+
+          {/* Backbone orange button */}
+          <circle cx="255" cy="105" r="7.5" fill={pulsing ? ac : "#a03a08"}/>
+          {/* waveform bars inside */}
+          {[0,1,2,3,4].map(i => {
+            const h = [2,4,6,4,2][i];
+            return <rect key={i} x={251.5+i*1.6} y={105-h/2} width="1.2" height={h} rx="0.6" fill="#fff" opacity="0.9"/>;
+          })}
+
+          {/* Menu / hamburger button */}
+          <circle cx="244" cy="108" r="5.5" fill={bf}/>
+          {[-2,0,2].map(y => <rect key={y} x="241" y={107+y} width="6" height="1.2" rx="0.6" fill="#555"/>)}
+
+          {/* ═══ USB-C CABLE ═══ */}
+
+          {pulsing ? (
+            <>
+              {/* PLUGGED IN — cable exits port, flows down, connector face at bottom */}
+              <rect x="136" y="93" width="8" height="48" rx="4" fill={cc}/>
+              {[0,1,2].map(i => (
+                <rect key={i} x="134" y={141+i*5} width="12" height="3.5" rx="1.75"
+                      fill={`${ac}${["55","35","20"][i]}`}/>
+              ))}
+              <rect x="124" y="156" width="32" height="22" rx="11" fill="#18182a" stroke={sc} strokeWidth="1.5"/>
+              <rect x="128" y="178" width="24" height="13" rx="6.5" fill={ac} stroke={sc} strokeWidth="1.2"/>
+              <rect x="132" y="181" width="16" height="7"  rx="3.5" fill="#0a0a14"/>
+              <rect x="133" y="182" width="14" height="2"  rx="1"   fill="#f0b030" opacity="0.85"/>
+              <rect x="133" y="185" width="14" height="2"  rx="1"   fill="#f0b030" opacity="0.5"/>
+              <circle cx="140" cy="130" r="3" fill={ac} className="bb-p0"/>
+              <circle cx="140" cy="115" r="3" fill={ac} className="bb-p1"/>
+              <circle cx="140" cy="100" r="3" fill={ac} className="bb-p2"/>
+            </>
+          ) : (
+            <>
+              {/* NOT PLUGGED IN — dotted gap, connector tip facing UP toward port */}
+              {[0,1,2].map(i => (
+                <rect key={i} x="139" y={95+i*7} width="2" height="4" rx="1" fill="#3a3a50" opacity="0.7"/>
+              ))}
+              {/* Connector face — tip pointing UP toward port */}
+              <rect x="128" y="116" width="24" height="13" rx="6.5" fill="#262636" stroke={sc} strokeWidth="1.2"/>
+              <rect x="132" y="119" width="16" height="7"  rx="3.5" fill="#0a0a14"/>
+              <rect x="133" y="120" width="14" height="2"  rx="1"   fill="#2e2840" opacity="0.85"/>
+              <rect x="133" y="123" width="14" height="2"  rx="1"   fill="#2e2840" opacity="0.5"/>
+              {/* Barrel */}
+              <rect x="124" y="129" width="32" height="22" rx="11" fill="#18182a" stroke={sc} strokeWidth="1.5"/>
+              {/* Strain relief */}
+              {[0,1,2].map(i => (
+                <rect key={i} x="134" y={154+i*5} width="12" height="3.5" rx="1.75"
+                      fill={["#26263a","#222234","#1e1e2e"][i]}/>
+              ))}
+              {/* Cable hanging down */}
+              <rect x="136" y="169" width="8" height="23" rx="4" fill={cc}/>
+            </>
+          )}
+        </svg>
+      );
+    }
+
+    const DEMO_DEVICES = [
+      { id:"demo-001", deviceName:"Backbone Pro - Proto Rev C",  serialNumber:"BBP2025-007-RC", firmwareVersion:"", type:"Backbone Pro", project:"" },
+      { id:"demo-002", deviceName:"Backbone One - Midnight EVT", serialNumber:"BB2024-001-MK",  firmwareVersion:"", type:"Backbone One", project:"" },
+      { id:"demo-003", deviceName:"Dev Unit #14",                serialNumber:"DEV2025-014",    firmwareVersion:"", type:"Backbone Pro", project:"" },
+    ];
+
+    function ConnectTab({ connecting, lastEvent, activity, units, currentUser, isReady, onSimulate, onDevicePaired, onShowAll, onReset }) {
+      const todayStr = new Date().toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" });
+      const myUnits    = currentUser ? units.filter(u => u.owner === currentUser) : [];
+      const todayUnits = units.filter(u => u.lastSeen === todayStr);
+      const myCount    = myUnits.length;
+
+      const [pairing, setPairing]           = React.useState(false);
+      const [pairError, setPairError]       = React.useState(null);
+      const [activePopover, setActivePopover] = React.useState(null); // null | "mine" | "today"
+      const togglePopover = (key) => setActivePopover(prev => prev === key ? null : key);
+
+      const pairDevice = async () => {
+        if (!navigator.usb) { setPairError("WebUSB not supported — use Chrome on desktop."); return; }
+        setPairing(true); setPairError(null);
+        try {
+          const device = await navigator.usb.requestDevice({ filters: [] });
+          setPairError(null);
+          if (onDevicePaired) onDevicePaired(device); // immediately show modal with real device data
+        } catch (e) {
+          if (e.name !== "NotFoundError") setPairError(e.message); // NotFoundError = user cancelled
+        } finally { setPairing(false); }
+      };
+
+      return (
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 300px", gap:"20px", alignItems:"start" }}>
+          <div style={{ display:"flex", flexDirection:"column", gap:"16px" }}>
+            <div style={{ ...cardSty, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minHeight:"300px", textAlign:"center", gap:"14px", border:connecting?`1px solid ${C.orange}55`:`1px solid ${C.border}`, transition:"border-color 0.3s" }}>
+              {connecting ? (
+                <>
+                  <BackboneIllustration pulsing={true} />
+                  <div style={{ fontWeight:"700", fontSize:"20px" }}>Detecting device…</div>
+                  <div style={{ color:C.muted, fontSize:"14px" }}>Reading serial number and device info</div>
+                </>
+              ) : lastEvent ? (
+                <>
+                  <div style={{ fontSize:"48px" }}>{lastEvent.type==="ownership"?"✅":"🔍"}</div>
+                  <div style={{ fontWeight:"700", fontSize:"20px" }}>{lastEvent.type==="ownership"?"Ownership Updated":"Device Checked In"}</div>
+                  <div style={{ color:C.muted, fontSize:"14px" }}>{lastEvent.device}</div>
+                  <div style={{ background:C.green+"15", border:`1px solid ${C.green}35`, borderRadius:"8px", padding:"10px 18px", fontSize:"13px", color:C.green }}>
+                    {lastEvent.type==="ownership" ? `Now assigned to ${lastEvent.owner}` : "No change — check-in logged"}
+                  </div>
+                  {!isReady && <div style={{ color:"#ffb020", fontSize:"12px", background:"#ffb02015", border:"1px solid #ffb02030", borderRadius:"6px", padding:"6px 12px" }}>Demo mode — data is not saved</div>}
+                  <button onClick={onReset} style={{ ...btnGhost, marginTop:"4px" }}>🔗 Connect another device</button>
+                </>
+              ) : (
+                <>
+                  <BackboneIllustration />
+                  <div style={{ fontWeight:"700", fontSize:"22px" }}>Connect a Backbone device</div>
+                  <div style={{ color:C.muted, fontSize:"14px", maxWidth:"320px", lineHeight:"1.7" }}>Plug a Backbone prototype via USB-C, then click below to authorize it the first time.</div>
+                  <button onClick={pairDevice} disabled={pairing} style={{ ...btnOrange, marginTop:"4px", opacity:pairing?0.7:1 }}>
+                    {pairing ? "Opening device picker…" : "🔗 Pair / authorize device"}
+                  </button>
+                  {pairError && <div style={{ color:"#ff7070", fontSize:"12px", background:"#ff3b3b12", border:"1px solid #ff3b3b30", borderRadius:"6px", padding:"6px 12px", maxWidth:"280px" }}>{pairError}</div>}
+                  {!isReady && <div style={{ color:"#ffb020", fontSize:"12px", background:"#ffb02015", border:"1px solid #ffb02030", borderRadius:"6px", padding:"6px 12px" }}>Demo mode — configure SCRIPT_URL to save data</div>}
+                </>
+              )}
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:"12px" }}>
+              <StatCard label="Total Units"     value={units.length}            color={C.text}   onClick={onShowAll}                   enabled={units.length > 0} />
+              <StatCard label="Assigned to You" value={currentUser ? myCount : "—"} color={C.orange} onClick={() => togglePopover("mine")}  enabled={!!(currentUser && myCount > 0)} active={activePopover === "mine"} />
+              <StatCard label="Logged Today"    value={todayUnits.length}       color={C.green}  onClick={() => togglePopover("today")} enabled={todayUnits.length > 0}           active={activePopover === "today"} />
+            </div>
+
+            {activePopover && (() => {
+              const popUnits = activePopover === "mine" ? myUnits : todayUnits;
+              const popLabel = activePopover === "mine" ? `Assigned to ${currentUser}` : "Logged Today";
+              return (
+                <div style={{ ...cardSty, padding:"16px 18px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"12px" }}>
+                    <div style={{ ...labelSty }}>{popLabel} ({popUnits.length})</div>
+                    <button onClick={() => setActivePopover(null)} style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:"18px", lineHeight:1, padding:"0 2px" }}>×</button>
+                  </div>
+                  {popUnits.length === 0 ? (
+                    <div style={{ color:"#444", fontSize:"13px" }}>None to show</div>
+                  ) : popUnits.map((u, i) => (
+                    <div key={u.id} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderTop: i === 0 ? "none" : `1px solid ${C.border}` }}>
+                      <div>
+                        <div style={{ fontSize:"13px", fontWeight:"600" }}>{u.deviceName}</div>
+                        <div style={{ fontSize:"11px", color:C.muted, fontFamily:"monospace", marginTop:"2px" }}>{u.serialNumber}</div>
+                      </div>
+                      <div style={{ display:"flex", gap:"6px", alignItems:"center", flexWrap:"wrap", justifyContent:"flex-end" }}>
+                        {u.type    && <Tag color={modelColor(u.type)}>{u.type}</Tag>}
+                        {u.project && <Tag color={projectColor(u.project)}>{u.project}</Tag>}
+                        {activePopover === "today" && u.owner && <span style={{ fontSize:"12px", color:C.muted }}>{u.owner}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+
+          <div style={{ display:"flex", flexDirection:"column", gap:"16px" }}>
+            <div style={cardSty}>
+              <div style={{ fontSize:"11px", fontWeight:"700", color:C.orange, letterSpacing:"1px", marginBottom:"14px" }}>⚡ DEMO — SIMULATE PLUG-IN</div>
+              <div style={{ display:"flex", flexDirection:"column", gap:"8px" }}>
+                {DEMO_DEVICES.map(d => (
+                  <button key={d.id} onClick={() => onSimulate(d)} disabled={connecting} style={{ background:C.item, border:`1px solid ${C.border}`, borderRadius:"8px", color:C.text, padding:"10px 14px", textAlign:"left", cursor:connecting?"not-allowed":"pointer", opacity:connecting?0.5:1, display:"flex", flexDirection:"column", gap:"3px" }}>
+                    <span style={{ fontSize:"13px", fontWeight:"600" }}>{d.deviceName}</span>
+                    <span style={{ fontSize:"11px", color:C.muted, fontFamily:"monospace" }}>{d.serialNumber}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={cardSty}>
+              <div style={{ ...labelSty, marginBottom:"14px" }}>Session Activity</div>
+              {activity.length === 0
+                ? <div style={{ color:"#444", fontSize:"13px", textAlign:"center", padding:"16px 0" }}>No activity yet</div>
+                : activity.map((a, i) => (
+                  <div key={i} style={{ display:"flex", gap:"10px", alignItems:"flex-start", marginBottom:i<activity.length-1?"12px":0 }}>
+                    <span style={{ fontSize:"15px" }}>{a.icon}</span>
+                    <div>
+                      <div style={{ fontSize:"13px", lineHeight:"1.5" }}>{a.text}</div>
+                      <div style={{ fontSize:"11px", color:C.muted, marginTop:"2px" }}>{a.time}</div>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DEVICE MODAL
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function DeviceModal({ device, currentUser, allModels, onAddModel, allProjects, onAddProject, lists, onRespond, onClose }) {
+      const detectedFw = device.firmwareVersion && !device.firmwareVersion.includes("?");
+      const [fw, setFw]               = useState(detectedFw ? device.firmwareVersion : "");
+      const [model, setModel]         = useState(device.type || "");
+      const [project, setProject]     = useState(device.project || "");
+      const [list, setList]           = useState(device.list || "");
+      const [newModel, setNewModel]   = useState("");
+      const [addingModel, setAddingModel] = useState(false);
+      const [newProject, setNewProject]   = useState("");
+      const [addingProject, setAddingProject] = useState(false);
+
+      const handleAddModel = () => {
+        if (newModel.trim()) { onAddModel(newModel.trim()); setModel(newModel.trim()); setNewModel(""); setAddingModel(false); }
+      };
+      const handleAddProject = () => {
+        if (newProject.trim()) { onAddProject(newProject.trim()); setProject(newProject.trim()); setNewProject(""); setAddingProject(false); }
+      };
+
+      const [saving, setSaving]     = useState(false);
+      const [saveLabel, setSaveLabel] = useState("");
+
+      const respond = async (take) => {
+        setSaveLabel(take ? "Assigning to you…" : "Logging check-in…");
+        setSaving(true);
+        try { await onRespond(take, fw, model, project, list); }
+        finally { setSaving(false); }
+      };
+
+      return (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", backdropFilter:"blur(10px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200, padding:"20px" }}>
+          <div style={{ background:"#17171b", border:`1px solid ${saving ? C.orange+"80" : C.border}`, borderRadius:"18px", width:"100%", maxWidth:"420px", overflow:"hidden", boxShadow:"0 32px 100px rgba(0,0,0,0.7)", transition:"border-color 0.3s", position:"relative" }}>
+
+            {/* ── Saving overlay ── */}
+            {saving && (
+              <div style={{ position:"absolute", inset:0, background:"rgba(14,14,18,0.92)", backdropFilter:"blur(6px)", zIndex:10, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:"18px", borderRadius:"18px" }}>
+                <style>{`@keyframes bb-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}`}</style>
+                <div style={{ width:"56px", height:"56px", position:"relative", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                  <div style={{ position:"absolute", inset:0, border:`3px solid ${C.orange}22`, borderTop:`3px solid ${C.orange}`, borderRadius:"50%", animation:"bb-spin 0.9s linear infinite" }} />
+                  <div style={{ width:"36px", height:"36px", background:C.orange, borderRadius:"10px", display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"900", fontSize:"18px" }}>B</div>
+                </div>
+                <div style={{ fontWeight:"700", fontSize:"17px" }}>{saveLabel}</div>
+                <div style={{ color:C.muted, fontSize:"13px" }}>Recording to Google Sheets…</div>
+              </div>
+            )}
+
+            <div style={{ background:C.orange+"12", borderBottom:`1px solid ${C.border}`, padding:"18px 24px", display:"flex", alignItems:"center", gap:"14px" }}>
+              <div style={{ width:"44px", height:"44px", background:C.orange+"12", borderRadius:"10px", display:"flex", alignItems:"center", justifyContent:"center", overflow:"hidden" }}>
+                <svg width="44" height="44" viewBox="0 0 280 130">
+                  {/* left grip */}
+                  <rect x="2"   y="14" width="90" height="100" rx="40" fill="#181820" stroke="#f47b2055" strokeWidth="2"/>
+                  {/* right grip */}
+                  <rect x="188" y="14" width="90" height="100" rx="40" fill="#181820" stroke="#f47b2055" strokeWidth="2"/>
+                  {/* center bridge */}
+                  <rect x="87" y="30" width="106" height="64" rx="10" fill="#1c1c26" stroke="#f47b2055" strokeWidth="2"/>
+                  {/* BACKBONE text */}
+                  <text x="140" y="72" textAnchor="middle" fill="#f47b2044" fontSize="10" fontWeight="700" letterSpacing="3" fontFamily="system-ui">BACKBONE</text>
+                  {/* left analog stick */}
+                  <circle cx="47" cy="46" r="22" fill="#111118" stroke="#1e1e28" strokeWidth="2"/>
+                  <circle cx="47" cy="46" r="8"  fill="#242430"/>
+                  {/* D-pad */}
+                  <rect x="29" y="82" width="36" height="12" rx="5" fill="#262630"/>
+                  <rect x="41" y="70" width="12" height="36" rx="5" fill="#262630"/>
+                  {/* ABXY */}
+                  <circle cx="233" cy="44" r="12" fill="#262630"/>
+                  <circle cx="218" cy="59" r="12" fill="#262630"/>
+                  <circle cx="248" cy="59" r="12" fill="#262630"/>
+                  <circle cx="233" cy="74" r="12" fill="#262630"/>
+                  <text x="233" y="48.5" textAnchor="middle" fill="#5a5a6a" fontSize="12" fontWeight="700">Y</text>
+                  <text x="218" y="63.5" textAnchor="middle" fill="#5a5a6a" fontSize="12" fontWeight="700">X</text>
+                  <text x="248" y="63.5" textAnchor="middle" fill="#5a5a6a" fontSize="12" fontWeight="700">B</text>
+                  <text x="233" y="78.5" textAnchor="middle" fill="#5a5a6a" fontSize="12" fontWeight="700">A</text>
+                  {/* right analog stick */}
+                  <circle cx="233" cy="98" r="22" fill="#111118" stroke="#1e1e28" strokeWidth="2"/>
+                  <circle cx="233" cy="98" r="8"  fill="#242430"/>
+                  {/* Backbone orange button */}
+                  <circle cx="258" cy="110" r="10" fill="#f47b20"/>
+                </svg>
+              </div>
+              <div style={{ flex:1 }}>
+                <div style={{ fontWeight:"700", fontSize:"15px" }}>Device Connected</div>
+                <div style={{ fontSize:"13px", marginTop:"2px", color: device.isNew ? C.muted : C.orange, fontWeight: device.isNew ? "400" : "700" }}>{device.isNew ? "New unit — not yet registered" : "Registered unit found"}</div>
+              </div>
+              {device.isNew && <span style={{ background:C.green+"20", color:C.green, border:`1px solid ${C.green}40`, borderRadius:"20px", padding:"3px 10px", fontSize:"11px", fontWeight:"700" }}>NEW</span>}
+              <button onClick={onClose} title="Cancel" style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:"20px", lineHeight:1, padding:"4px", marginLeft:"4px" }}>×</button>
+            </div>
+
+            <div style={{ padding:"22px 24px" }}>
+              <div style={{ fontWeight:"700", fontSize:"17px", marginBottom:"14px" }}>{device.deviceName}</div>
+
+              {/* Existing device banner */}
+              {!device.isNew && (
+                <div style={{ background:"#60a5fa18", border:`1px solid #60a5fa40`, borderRadius:"10px", padding:"12px 16px", marginBottom:"16px", display:"flex", gap:"12px", alignItems:"flex-start" }}>
+                  <span style={{ fontSize:"18px", flexShrink:0, marginTop:"1px" }}>ℹ️</span>
+                  <div>
+                    <div style={{ fontWeight:"700", fontSize:"13px", color:"#60a5fa", marginBottom:"4px" }}>This device is already registered</div>
+                    <div style={{ fontSize:"13px", color:C.muted, lineHeight:"1.6" }}>
+                      Currently assigned to <span style={{ color:C.text, fontWeight:"600" }}>{device.currentOwner}</span>
+                      {device.lastSeen && device.lastSeen !== "Never" && (
+                        <>, last seen <span style={{ color:C.text, fontWeight:"600" }}>{device.lastSeen}</span></>
+                      )}.
+                    </div>
+                    <div style={{ fontSize:"12px", color:"#60a5fa99", marginTop:"6px" }}>
+                      Press <strong style={{ color:"#60a5fa" }}>Yes</strong> to take ownership, or <strong style={{ color:"#60a5fa" }}>No</strong> to log a check-in without changing the owner.
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Serial + Last Owner */}
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"16px", marginBottom:"16px" }}>
+                {[
+                  { label:"Serial Number", value:device.serialNumber, mono:true },
+                  { label:"Last Owner",    value:device.currentOwner, highlight:device.currentOwner !== "Unregistered" },
+                ].map(({ label, value, mono, highlight }) => (
+                  <div key={label}>
+                    <div style={labelSty}>{label}</div>
+                    <div style={{ fontSize:"13px", fontWeight:"600", marginTop:"5px", fontFamily:mono?"monospace":"inherit", color:highlight?C.orange:C.text }}>{value}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Type dropdown */}
+              <div style={{ marginBottom:"14px" }}>
+                <div style={{ ...labelSty, marginBottom:"6px" }}>Type</div>
+                {addingModel ? (
+                  <div style={{ display:"flex", gap:"8px" }}>
+                    <input value={newModel} onChange={e => setNewModel(e.target.value)} onKeyDown={e => e.key==="Enter" && handleAddModel()} placeholder="New type name…" style={{ ...inputSty, fontSize:"13px" }} autoFocus />
+                    <button onClick={handleAddModel} style={{ ...btnOrange, padding:"8px 14px", fontSize:"13px", whiteSpace:"nowrap" }}>Add</button>
+                    <button onClick={() => setAddingModel(false)} style={{ ...btnGhost, padding:"8px 12px", fontSize:"13px" }}>✕</button>
+                  </div>
+                ) : (
+                  <div style={{ display:"flex", gap:"8px" }}>
+                    <select value={model} onChange={e => setModel(e.target.value)} style={{ ...selectSty, flex:1 }}>
+                      <option value="">Select a type…</option>
+                      {allModels.map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                    <button onClick={() => setAddingModel(true)} title="Add new type" style={{ ...btnGhost, padding:"8px 12px", fontSize:"16px" }}>+</button>
+                  </div>
+                )}
+              </div>
+
+              {/* Project dropdown */}
+              <div style={{ marginBottom:"14px" }}>
+                <div style={{ ...labelSty, marginBottom:"6px" }}>Project</div>
+                {addingProject ? (
+                  <div style={{ display:"flex", gap:"8px" }}>
+                    <input value={newProject} onChange={e => setNewProject(e.target.value)} onKeyDown={e => e.key==="Enter" && handleAddProject()} placeholder="New project name…" style={{ ...inputSty, fontSize:"13px" }} autoFocus />
+                    <button onClick={handleAddProject} style={{ ...btnOrange, padding:"8px 14px", fontSize:"13px", whiteSpace:"nowrap" }}>Add</button>
+                    <button onClick={() => setAddingProject(false)} style={{ ...btnGhost, padding:"8px 12px", fontSize:"13px" }}>✕</button>
+                  </div>
+                ) : (
+                  <div style={{ display:"flex", gap:"8px" }}>
+                    <select value={project} onChange={e => setProject(e.target.value)} style={{ ...selectSty, flex:1 }}>
+                      <option value="">Select a project…</option>
+                      {allProjects.map(p => <option key={p} value={p}>{p}</option>)}
+                    </select>
+                    <button onClick={() => setAddingProject(true)} title="Add new project" style={{ ...btnGhost, padding:"8px 12px", fontSize:"16px" }}>+</button>
+                  </div>
+                )}
+              </div>
+
+              {/* List dropdown */}
+              {lists && lists.filter(l => !l.archived).length > 0 && (
+                <div style={{ marginBottom:"14px" }}>
+                  <div style={{ ...labelSty, marginBottom:"6px" }}>List</div>
+                  <select value={list} onChange={e => setList(e.target.value)} style={{ ...selectSty, width:"100%" }}>
+                    <option value="">No list</option>
+                    {lists.filter(l => !l.archived).map(l => <option key={l.id} value={l.name}>{l.name}</option>)}
+                  </select>
+                </div>
+              )}
+
+              {/* Firmware input */}
+              <div style={{ marginBottom:"22px" }}>
+                <div style={{ display:"flex", alignItems:"baseline", gap:"8px", marginBottom:"6px" }}>
+                  <div style={labelSty}>Firmware Version</div>
+                  <span style={{ fontSize:"11px", color:C.muted }}>optional</span>
+                </div>
+                <input value={fw} onChange={e => setFw(e.target.value)} placeholder="e.g. v2.5.1" style={{ ...inputSty, fontFamily:"monospace", fontSize:"13px" }} />
+              </div>
+
+              <div style={{ background:C.item, border:`1px solid ${C.border}`, borderRadius:"10px", padding:"16px", marginBottom:"18px" }}>
+                <div style={{ fontWeight:"600", fontSize:"15px", marginBottom:"6px" }}>Are you the new owner of this unit?</div>
+                <div style={{ color:C.muted, fontSize:"13px", lineHeight:"1.5" }}>
+                  Selecting <strong style={{color:C.text}}>Yes</strong> will assign this unit to <strong style={{color:C.orange}}>{currentUser || "you"}</strong> and log the transfer.
+                </div>
+              </div>
+
+              <div style={{ display:"flex", gap:"10px" }}>
+                <button onClick={() => respond(true)}  disabled={saving} style={{ ...btnOrange, flex:2, opacity:saving?0.5:1 }}>✓ Yes, assign to me</button>
+                <button onClick={() => respond(false)} disabled={saving} style={{ ...btnGhost,  flex:1, opacity:saving?0.5:1 }}>No</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ALL UNITS TAB
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function UnitsTab({ units, totalUnits, allOwners, allModels, onAddModel, allProjects, onAddProject, lists, listFilter, setListFilter, search, setSearch, modelFilter, setModelFilter, projectFilter, setProjectFilter, ownerFilter, setOwnerFilter, lastSeenFilter, clearLastSeenFilter, showArchived, setShowArchived, sortOrder, setSortOrder, onSelect }) {
+      const [addingModel, setAddingModel]     = useState(false);
+      const [newModel, setNewModel]           = useState("");
+      const [addingProject, setAddingProject] = useState(false);
+      const [newProject, setNewProject]       = useState("");
+
+      const handleAddModel = () => {
+        if (newModel.trim()) { onAddModel(newModel.trim()); setNewModel(""); setAddingModel(false); }
+      };
+      const handleAddProject = () => {
+        if (newProject.trim()) { onAddProject(newProject.trim()); setNewProject(""); setAddingProject(false); }
+      };
+
+      return (
+        <div>
+          <div style={{ ...cardSty, display:"flex", gap:"12px", flexWrap:"wrap", alignItems:"center", marginBottom:"16px", padding:"14px 18px" }}>
+            <input placeholder="Search by name or serial #…" value={search} onChange={e => setSearch(e.target.value)} style={{ ...inputSty, maxWidth:"220px" }} />
+
+            {/* Project filter */}
+            {addingProject ? (
+              <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
+                <input value={newProject} onChange={e => setNewProject(e.target.value)} onKeyDown={e => e.key==="Enter" && handleAddProject()} placeholder="New project name…" style={{ ...inputSty, width:"160px", fontSize:"13px" }} autoFocus />
+                <button onClick={handleAddProject} style={{ ...btnOrange, padding:"8px 14px", fontSize:"13px" }}>Add</button>
+                <button onClick={() => setAddingProject(false)} style={{ ...btnGhost, padding:"8px 12px", fontSize:"13px" }}>✕</button>
+              </div>
+            ) : (
+              <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
+                <select value={projectFilter} onChange={e => setProjectFilter(e.target.value)} style={selectSty}>
+                  <option value="all">All Projects</option>
+                  {allProjects.map(p => <option key={p} value={p}>{p}</option>)}
+                </select>
+                <button onClick={() => setAddingProject(true)} title="Add new project" style={{ ...btnGhost, padding:"8px 12px", fontSize:"16px" }}>+</button>
+              </div>
+            )}
+
+            {/* Type filter */}
+            {addingModel ? (
+              <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
+                <input value={newModel} onChange={e => setNewModel(e.target.value)} onKeyDown={e => e.key==="Enter" && handleAddModel()} placeholder="New type name…" style={{ ...inputSty, width:"160px", fontSize:"13px" }} autoFocus />
+                <button onClick={handleAddModel} style={{ ...btnOrange, padding:"8px 14px", fontSize:"13px" }}>Add</button>
+                <button onClick={() => setAddingModel(false)} style={{ ...btnGhost, padding:"8px 12px", fontSize:"13px" }}>✕</button>
+              </div>
+            ) : (
+              <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
+                <select value={modelFilter} onChange={e => setModelFilter(e.target.value)} style={selectSty}>
+                  <option value="all">All Types</option>
+                  {allModels.map(m => <option key={m} value={m}>{m}</option>)}
+                </select>
+                <button onClick={() => setAddingModel(true)} title="Add new type" style={{ ...btnGhost, padding:"8px 12px", fontSize:"16px" }}>+</button>
+              </div>
+            )}
+
+            <select value={ownerFilter} onChange={e => setOwnerFilter(e.target.value)} style={selectSty}>
+              <option value="all">All Owners</option>
+              {allOwners.map(o => <option key={o} value={o}>{o}</option>)}
+            </select>
+            {lists && lists.length > 0 && (
+              <select value={listFilter} onChange={e => setListFilter(e.target.value)} style={selectSty}>
+                <option value="all">All Lists</option>
+                <option value="">No list</option>
+                {lists.filter(l => !l.archived).map(l => <option key={l.id} value={l.name}>{l.name}</option>)}
+              </select>
+            )}
+            {lastSeenFilter && (
+              <div style={{ display:"flex", alignItems:"center", gap:"6px", background:C.green+"18", border:`1px solid ${C.green}40`, borderRadius:"20px", padding:"4px 10px", fontSize:"12px", color:C.green }}>
+                📅 Today
+                <button onClick={clearLastSeenFilter} style={{ background:"none", border:"none", color:C.green, cursor:"pointer", fontSize:"14px", lineHeight:1, padding:"0 0 0 2px" }}>×</button>
+              </div>
+            )}
+            <button onClick={() => setSortOrder(o => o === "newest" ? "oldest" : "newest")} style={{ ...btnSmall, color:C.muted, marginLeft:"auto" }}>
+              {sortOrder === "newest" ? "↓ Newest first" : "↑ Oldest first"}
+            </button>
+            <button onClick={() => setShowArchived(v => !v)} style={{ ...btnSmall, color: showArchived ? C.orange : C.muted, borderColor: showArchived ? C.orange+"60" : C.border, background: showArchived ? C.orange+"12" : C.item }}>
+              {showArchived ? "Hide archived" : "Show archived"}
+            </button>
+            <div style={{ color:C.muted, fontSize:"13px" }}>
+              {units.length === totalUnits.length ? `${totalUnits.length} units` : `${units.length} of ${totalUnits.length}`}
+            </div>
+          </div>
+
+          <div style={cardSty}>
+            <div style={{ display:"grid", gridTemplateColumns:"1.5fr 0.8fr 0.8fr 0.9fr 1fr 0.7fr 0.85fr 1.1fr", gap:"12px", padding:"8px 14px 12px", borderBottom:`1px solid ${C.border}` }}>
+              {["Device Name","List","Project","Type","Serial #","Firmware","Owner","Notes"].map(h => <div key={h} style={labelSty}>{h}</div>)}
+            </div>
+            {units.length === 0
+              ? <div style={{ padding:"48px", textAlign:"center", color:C.muted }}>No units match your filters</div>
+              : units.map((u, i) => <UnitRow key={u.id||u.serialNumber} unit={u} isLast={i===units.length-1} onSelect={() => onSelect(u)} lists={lists} />)
+            }
+          </div>
+        </div>
+      );
+    }
+
+    function UnitRow({ unit, isLast, onSelect, lists }) {
+      const [hov, setHov] = useState(false);
+      const tc = modelColor(unit.type);
+      const pc = projectColor(unit.project);
+      const lc = listColor(unit.list, lists || []);
+      return (
+        <div onClick={onSelect} onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
+          style={{ display:"grid", gridTemplateColumns:"1.5fr 0.8fr 0.8fr 0.9fr 1fr 0.7fr 0.85fr 1.1fr", gap:"12px", padding:"14px", borderRadius:"8px", cursor:"pointer", background:hov?C.item:"transparent", borderBottom:isLast?"none":`1px solid ${C.border}40`, transition:"background 0.1s", alignItems:"center", opacity: unit.archived ? 0.5 : 1 }}>
+          <div>
+            <div style={{ display:"flex", alignItems:"center", gap:"8px" }}>
+              <span style={{ fontWeight:"600", fontSize:"14px" }}>{unit.deviceName}</span>
+              {unit.archived && <span style={{ fontSize:"10px", fontWeight:"700", color:"#888896", background:"#888896"+"20", border:"1px solid #88889640", borderRadius:"10px", padding:"2px 7px", letterSpacing:"0.5px" }}>ARCHIVED</span>}
+            </div>
+            <div style={{ color:C.muted, fontSize:"12px", marginTop:"2px" }}>Last seen: {unit.lastSeen||"—"}</div>
+          </div>
+          <div>{unit.list    ? <Tag color={lc}>{unit.list}</Tag>    : <span style={{ color:"#444", fontSize:"12px" }}>—</span>}</div>
+          <div>{unit.project ? <Tag color={pc}>{unit.project}</Tag> : <span style={{ color:"#444", fontSize:"12px" }}>—</span>}</div>
+          <div>{unit.type    ? <Tag color={tc}>{unit.type}</Tag>    : <span style={{ color:"#444", fontSize:"12px" }}>—</span>}</div>
+          <div style={{ fontSize:"12px", color:C.muted, fontFamily:"monospace" }}>{unit.serialNumber}</div>
+          <div>{unit.firmwareVersion ? <Tag color={C.blue}>{unit.firmwareVersion}</Tag> : <span style={{ color:"#444", fontSize:"12px" }}>—</span>}</div>
+          <div style={{ display:"flex", alignItems:"center", gap:"8px" }}>
+            <Avatar name={unit.owner||"?"} size={26} />
+            <span style={{ fontSize:"13px" }}>{unit.owner}</span>
+          </div>
+          <div style={{ fontSize:"12px", color:C.muted, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis" }}>
+            {unit.notes || <span style={{ color:"#333" }}>—</span>}
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // UNIT DETAIL MODAL  (with edit mode)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function UnitDetailModal({ unit, allModels, onAddModel, allProjects, onAddProject, allEvents, onAddEvent, lists, onEdit, onDelete, onClose }) {
+      const [transfers, setTransfers]         = useState([]);
+      const [editHistory, setEditHistory]     = useState([]);
+      const [loadingHist, setLoadingHist]     = useState(false);
+      const [histTab, setHistTab]             = useState("edits"); // "edits" | "transfers"
+      const [editing, setEditing]             = useState(false);
+      const [deleteConfirm, setDeleteConfirm] = useState(false);
+      const [editName, setEditName]           = useState(unit.deviceName);
+      const [editFw, setEditFw]               = useState(unit.firmwareVersion);
+      const [editModel, setEditModel]         = useState(unit.type);
+      const [editProject, setEditProject]     = useState(unit.project || "");
+      const [editList, setEditList]           = useState(unit.list || "");
+      const [editOwner, setEditOwner]         = useState(unit.owner || "");
+      const [editNotes, setEditNotes]         = useState(unit.notes || "");
+      const [editEvent, setEditEvent]         = useState(unit.event || "");
+      const [editLinks, setEditLinks]         = useState(() => Array.isArray(unit.links) ? [...unit.links] : []);
+      const [saving, setSaving]               = useState(false);
+      const [addingModel, setAddingModel]     = useState(false);
+      const [newModel, setNewModel]           = useState("");
+      const [addingProject, setAddingProject] = useState(false);
+      const [newProject, setNewProject]       = useState("");
+      const [addingEvent, setAddingEvent]     = useState(false);
+      const [newEvent, setNewEvent]           = useState("");
+
+      const addLink    = () => setEditLinks(prev => [...prev, { name: "", url: "" }]);
+      const removeLink = (i) => setEditLinks(prev => prev.filter((_, idx) => idx !== i));
+      const updateLink = (i, field, val) => setEditLinks(prev => prev.map((l, idx) => idx === i ? { ...l, [field]: val } : l));
+
+      useEffect(() => {
+        if (!IS_CONFIGURED || !unit?.serialNumber) return;
+        setLoadingHist(true);
+        Promise.all([
+          loadTransfers(unit.serialNumber),
+          loadHistory(unit.serialNumber),
+        ]).then(([t, h]) => {
+          setTransfers(t);
+          // Sort edit history newest-first
+          setEditHistory([...h].sort((a, b) => new Date(b.date) - new Date(a.date)));
+        }).catch(() => {}).finally(() => setLoadingHist(false));
+      }, [unit]);
+
+      const handleSave = async () => {
+        setSaving(true);
+        const cleanLinks = editLinks.filter(l => l.url.trim());
+        await onEdit(unit.id, { deviceName: editName, firmwareVersion: editFw, type: editModel, project: editProject, list: editList, owner: editOwner, notes: editNotes, event: editEvent, links: cleanLinks });
+        setSaving(false);
+        setEditing(false);
+        onClose();
+      };
+
+      const handleAddModel = () => {
+        if (newModel.trim()) { onAddModel(newModel.trim()); setEditModel(newModel.trim()); setNewModel(""); setAddingModel(false); }
+      };
+      const handleAddProject = () => {
+        if (newProject.trim()) { onAddProject(newProject.trim()); setEditProject(newProject.trim()); setNewProject(""); setAddingProject(false); }
+      };
+      const handleAddEvent = () => {
+        if (newEvent.trim()) { onAddEvent && onAddEvent(newEvent.trim()); setEditEvent(newEvent.trim()); setNewEvent(""); setAddingEvent(false); }
+      };
+
+      if (!unit) return null;
+      const tc = modelColor(editing ? editModel : unit.type);
+      const pc = projectColor(editing ? editProject : unit.project);
+
+      return (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", backdropFilter:"blur(10px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200, padding:"20px" }}>
+          <div style={{ background:"#17171b", border:`1px solid ${C.border}`, borderRadius:"18px", width:"100%", maxWidth:"480px", maxHeight:"85vh", overflow:"auto", boxShadow:"0 32px 100px rgba(0,0,0,0.7)" }}>
+
+            {/* Header */}
+            <div style={{ padding:"20px 24px", borderBottom:`1px solid ${C.border}`, display:"flex", justifyContent:"space-between", alignItems:"flex-start", position:"sticky", top:0, background:"#17171b" }}>
+              <div>
+                <div style={{ fontWeight:"700", fontSize:"16px" }}>{editing ? editName || unit.deviceName : unit.deviceName}</div>
+                <div style={{ marginTop:"8px", display:"flex", gap:"6px", flexWrap:"wrap" }}>
+                  {(editing ? editProject : unit.project) ? <Tag color={pc}>{editing ? editProject : unit.project}</Tag> : null}
+                  {(editing ? editModel   : unit.type)    ? <Tag color={tc}>{editing ? editModel   : unit.type}</Tag>    : <span style={{color:"#444",fontSize:"12px"}}>No type set</span>}
+                </div>
+              </div>
+              <div style={{ display:"flex", gap:"8px" }}>
+                {!editing && !deleteConfirm && <button onClick={() => setEditing(true)} style={{ ...btnSmall, color:C.orange, borderColor:C.orange+"50", background:C.orange+"10" }}>Edit</button>}
+                {!editing && !deleteConfirm && (
+                  <button
+                    onClick={async () => {
+                      const newVal = !unit.archived;
+                      await onEdit(unit.id, { archived: newVal });
+                      onClose();
+                    }}
+                    style={{ ...btnSmall, color: unit.archived ? C.green : C.muted, borderColor: unit.archived ? C.green+"50" : C.border }}>
+                    {unit.archived ? "Restore" : "Archive"}
+                  </button>
+                )}
+                {!editing && !deleteConfirm && onDelete && (
+                  <button onClick={() => setDeleteConfirm(true)} style={{ ...btnSmall, color:"#ff7070", borderColor:"#ff3b3b40" }}>Delete</button>
+                )}
+                {deleteConfirm && (
+                  <>
+                    <span style={{ fontSize:"13px", color:"#ff7070", alignSelf:"center" }}>Delete forever?</span>
+                    <button onClick={async () => { await onDelete(unit.id); onClose(); }} style={{ ...btnSmall, color:"#fff", background:"#ef4444", borderColor:"#ef4444" }}>Yes, delete</button>
+                    <button onClick={() => setDeleteConfirm(false)} style={btnSmall}>Cancel</button>
+                  </>
+                )}
+                {!deleteConfirm && <button onClick={onClose} style={btnSmall}>Close</button>}
+              </div>
+            </div>
+
+            {/* Edit mode */}
+            {editing ? (
+              <div style={{ padding:"20px 24px", borderBottom:`1px solid ${C.border}` }}>
+                <div style={{ display:"flex", flexDirection:"column", gap:"14px" }}>
+
+                  <div>
+                    <div style={{ ...labelSty, marginBottom:"6px" }}>Device Name</div>
+                    <input value={editName} onChange={e => setEditName(e.target.value)} style={inputSty} />
+                  </div>
+
+                  <div>
+                    <div style={{ ...labelSty, marginBottom:"6px" }}>Project</div>
+                    {addingProject ? (
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        <input value={newProject} onChange={e => setNewProject(e.target.value)} onKeyDown={e => e.key==="Enter" && handleAddProject()} placeholder="New project name…" style={{ ...inputSty, fontSize:"13px" }} autoFocus />
+                        <button onClick={handleAddProject} style={{ ...btnOrange, padding:"8px 14px", fontSize:"13px" }}>Add</button>
+                        <button onClick={() => setAddingProject(false)} style={{ ...btnGhost, padding:"8px 12px", fontSize:"13px" }}>✕</button>
+                      </div>
+                    ) : (
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        <select value={editProject} onChange={e => setEditProject(e.target.value)} style={{ ...selectSty, flex:1 }}>
+                          <option value="">Select a project…</option>
+                          {allProjects.map(p => <option key={p} value={p}>{p}</option>)}
+                        </select>
+                        <button onClick={() => setAddingProject(true)} title="Add new project" style={{ ...btnGhost, padding:"8px 12px", fontSize:"16px" }}>+</button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <div style={{ ...labelSty, marginBottom:"6px" }}>Type</div>
+                    {addingModel ? (
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        <input value={newModel} onChange={e => setNewModel(e.target.value)} onKeyDown={e => e.key==="Enter" && handleAddModel()} placeholder="New type name…" style={{ ...inputSty, fontSize:"13px" }} autoFocus />
+                        <button onClick={handleAddModel} style={{ ...btnOrange, padding:"8px 14px", fontSize:"13px" }}>Add</button>
+                        <button onClick={() => setAddingModel(false)} style={{ ...btnGhost, padding:"8px 12px", fontSize:"13px" }}>✕</button>
+                      </div>
+                    ) : (
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        <select value={editModel} onChange={e => setEditModel(e.target.value)} style={{ ...selectSty, flex:1 }}>
+                          <option value="">Select a type…</option>
+                          {allModels.map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                        <button onClick={() => setAddingModel(true)} title="Add new type" style={{ ...btnGhost, padding:"8px 12px", fontSize:"16px" }}>+</button>
+                      </div>
+                    )}
+                  </div>
+
+                  {lists && lists.length > 0 && (
+                    <div>
+                      <div style={{ ...labelSty, marginBottom:"6px" }}>List</div>
+                      <select value={editList} onChange={e => setEditList(e.target.value)} style={{ ...selectSty, width:"100%" }}>
+                        <option value="">No list</option>
+                        {lists.filter(l => !l.archived).map(l => <option key={l.id} value={l.name}>{l.name}</option>)}
+                        {editList && !lists.filter(l=>!l.archived).some(l=>l.name===editList) && <option value={editList}>{editList} (archived)</option>}
+                      </select>
+                    </div>
+                  )}
+
+                  <div>
+                    <div style={{ display:"flex", alignItems:"baseline", gap:"8px", marginBottom:"6px" }}>
+                      <div style={labelSty}>Firmware Version</div>
+                      <span style={{ fontSize:"11px", color:C.muted }}>optional</span>
+                    </div>
+                    <input value={editFw} onChange={e => setEditFw(e.target.value)} placeholder="e.g. v2.5.1" style={{ ...inputSty, fontFamily:"monospace" }} />
+                  </div>
+
+                  <div>
+                    <div style={{ ...labelSty, marginBottom:"6px" }}>Owner</div>
+                    <input value={editOwner} onChange={e => setEditOwner(e.target.value)} placeholder="Name…" style={inputSty} />
+                  </div>
+
+                  <div>
+                    <div style={{ display:"flex", alignItems:"baseline", gap:"8px", marginBottom:"6px" }}>
+                      <div style={labelSty}>Notes</div>
+                      <span style={{ fontSize:"11px", color:C.muted }}>optional</span>
+                    </div>
+                    <textarea value={editNotes} onChange={e => setEditNotes(e.target.value)} placeholder="Any notes about this unit…" rows={3} style={{ ...inputSty, resize:"vertical", lineHeight:"1.5" }} />
+                  </div>
+
+                  {/* Event */}
+                  <div>
+                    <div style={{ ...labelSty, marginBottom:"6px" }}>Event</div>
+                    {addingEvent ? (
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        <input value={newEvent} onChange={e => setNewEvent(e.target.value)} onKeyDown={e => e.key==="Enter" && handleAddEvent()} placeholder="New event name…" style={{ ...inputSty, fontSize:"13px" }} autoFocus />
+                        <button onClick={handleAddEvent} style={{ ...btnOrange, padding:"8px 14px", fontSize:"13px" }}>Add</button>
+                        <button onClick={() => setAddingEvent(false)} style={{ ...btnGhost, padding:"8px 12px", fontSize:"13px" }}>✕</button>
+                      </div>
+                    ) : (
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        <select value={editEvent} onChange={e => setEditEvent(e.target.value)} style={{ ...selectSty, flex:1 }}>
+                          <option value="">No event</option>
+                          {(allEvents || []).map(ev => <option key={ev} value={ev}>{ev}</option>)}
+                        </select>
+                        <button onClick={() => setAddingEvent(true)} title="Add new event type" style={{ ...btnGhost, padding:"8px 12px", fontSize:"16px" }}>+</button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Reference Links */}
+                  <div>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"8px" }}>
+                      <div style={labelSty}>Reference Links</div>
+                      <button onClick={addLink} style={{ ...btnSmall, fontSize:"12px", padding:"4px 10px", color:C.orange, borderColor:C.orange+"50", background:C.orange+"10" }}>+ Add link</button>
+                    </div>
+                    {editLinks.length === 0 && <div style={{ color:"#444", fontSize:"12px" }}>No links yet</div>}
+                    {editLinks.map((link, i) => (
+                      <div key={i} style={{ display:"flex", gap:"8px", marginBottom:"8px", alignItems:"center" }}>
+                        <input value={link.name} onChange={e => updateLink(i, "name", e.target.value)} placeholder="Link name…" style={{ ...inputSty, flex:"0 0 120px", fontSize:"13px" }} />
+                        <input value={link.url} onChange={e => updateLink(i, "url", e.target.value)} placeholder="https://…" style={{ ...inputSty, flex:1, fontSize:"13px", fontFamily:"monospace" }} />
+                        <button onClick={() => removeLink(i)} style={{ background:"none", border:"none", color:"#ff7070", cursor:"pointer", fontSize:"18px", lineHeight:1, flexShrink:0, padding:"0 2px" }}>×</button>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ display:"flex", gap:"10px", marginTop:"4px" }}>
+                    <button onClick={handleSave} disabled={saving} style={{ ...btnOrange, flex:1, opacity:saving?0.7:1 }}>{saving ? "Saving…" : "Save Changes"}</button>
+                    <button onClick={() => { setEditing(false); setEditName(unit.deviceName); setEditFw(unit.firmwareVersion); setEditModel(unit.type); setEditProject(unit.project||""); setEditList(unit.list||""); setEditOwner(unit.owner||""); setEditNotes(unit.notes||""); setEditEvent(unit.event||""); setEditLinks(Array.isArray(unit.links)?[...unit.links]:[]); }} style={{ ...btnGhost, flex:1 }}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              /* View mode */
+              <div style={{ padding:"20px 24px", borderBottom:`1px solid ${C.border}` }}>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"18px" }}>
+                  {[
+                    { label:"Serial Number",    value:unit.serialNumber,           mono:true },
+                    { label:"Project",          value:unit.project    || "—" },
+                    { label:"List",             value:unit.list       || "—" },
+                    { label:"Firmware Version", value:unit.firmwareVersion || "—", mono:true },
+                    { label:"Current Owner",    value:unit.owner,                  orange:true },
+                    { label:"Last Seen",        value:unit.lastSeen },
+                  ].map(({ label, value, mono, orange }) => (
+                    <div key={label}>
+                      <div style={labelSty}>{label}</div>
+                      <div style={{ fontSize:"14px", fontWeight:"600", marginTop:"5px", fontFamily:mono?"monospace":"inherit", color:orange?C.orange:C.text }}>{value||"—"}</div>
+                    </div>
+                  ))}
+                  {unit.event && (
+                    <div>
+                      <div style={labelSty}>Event</div>
+                      <div style={{ marginTop:"5px" }}><Tag color="#a78bfa">{unit.event}</Tag></div>
+                    </div>
+                  )}
+                  {unit.notes && (
+                    <div style={{ gridColumn:"1 / -1" }}>
+                      <div style={labelSty}>Notes</div>
+                      <div style={{ fontSize:"13px", marginTop:"5px", color:C.muted, lineHeight:"1.6", whiteSpace:"pre-wrap" }}>{unit.notes}</div>
+                    </div>
+                  )}
+                  {Array.isArray(unit.links) && unit.links.length > 0 && (
+                    <div style={{ gridColumn:"1 / -1" }}>
+                      <div style={{ ...labelSty, marginBottom:"8px" }}>Reference Links</div>
+                      <div style={{ display:"flex", flexDirection:"column", gap:"6px" }}>
+                        {unit.links.filter(l => l.url).map((l, i) => (
+                          <a key={i} href={l.url} target="_blank" rel="noopener noreferrer"
+                             style={{ display:"inline-flex", alignItems:"center", gap:"6px", fontSize:"13px", color:C.blue, textDecoration:"none", background:C.blue+"12", border:`1px solid ${C.blue}30`, borderRadius:"7px", padding:"6px 12px", width:"fit-content" }}>
+                            <span>🔗</span>
+                            <span style={{ fontWeight:"600" }}>{l.name || l.url}</span>
+                            {l.name && <span style={{ color:C.muted, fontSize:"11px", fontFamily:"monospace", overflow:"hidden", textOverflow:"ellipsis", maxWidth:"200px", whiteSpace:"nowrap" }}>{l.url}</span>}
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* History tabs */}
+            <div style={{ padding:"20px 24px" }}>
+              {/* Tab switcher */}
+              <div style={{ display:"flex", gap:"0", marginBottom:"16px", borderBottom:`1px solid ${C.border}` }}>
+                {[
+                  { key:"edits",     label:`Edit History${editHistory.length > 0 ? ` (${editHistory.length})` : ""}` },
+                  { key:"transfers", label:`Transfers${transfers.length > 0 ? ` (${transfers.length})` : ""}` },
+                ].map(t => (
+                  <button key={t.key} onClick={() => setHistTab(t.key)} style={{ background:"none", border:"none", borderBottom:histTab===t.key?`2px solid ${C.orange}`:"2px solid transparent", color:histTab===t.key?C.text:C.muted, padding:"6px 14px 10px", fontSize:"12px", fontWeight:histTab===t.key?"700":"400", cursor:"pointer", marginBottom:"-1px" }}>
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+
+              {loadingHist ? (
+                <div style={{ color:C.muted, fontSize:"13px" }}>Loading…</div>
+              ) : histTab === "edits" ? (
+                /* Edit History */
+                editHistory.length === 0 ? (
+                  <div style={{ color:"#444", fontSize:"13px" }}>No edits logged yet</div>
+                ) : editHistory.map((h, i) => {
+                  const dateStr = h.date ? new Date(h.date).toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" }) : "—";
+                  const timeStr = h.date ? new Date(h.date).toLocaleTimeString("en-US", { hour:"numeric", minute:"2-digit" }) : "";
+                  const isFirst = i === 0;
+                  const isLast  = i === editHistory.length - 1;
+                  return (
+                    <div key={i} style={{ display:"flex", gap:"12px", paddingBottom:isLast?0:"14px" }}>
+                      <div style={{ display:"flex", flexDirection:"column", alignItems:"center", width:"14px", flexShrink:0 }}>
+                        <div style={{ width:"8px", height:"8px", borderRadius:"50%", background:isFirst?C.orange:"#3a3a44", marginTop:"5px", flexShrink:0 }} />
+                        {!isLast && <div style={{ width:"2px", flex:1, background:"#2a2a34", marginTop:"4px" }} />}
+                      </div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ fontSize:"13px", fontWeight:"600", color:isFirst?C.text:C.muted }}>
+                          <span style={{ color:C.orange+"cc" }}>{h.field}</span>
+                          <span style={{ fontWeight:"400", color:C.muted }}> changed</span>
+                        </div>
+                        <div style={{ fontSize:"12px", color:C.muted, marginTop:"2px", display:"flex", gap:"6px", flexWrap:"wrap", alignItems:"center" }}>
+                          {h.oldValue && <><span style={{ textDecoration:"line-through", opacity:0.6 }}>{h.oldValue}</span><span>→</span></>}
+                          <span style={{ color:C.text+"cc" }}>{h.newValue || "—"}</span>
+                        </div>
+                        <div style={{ fontSize:"11px", color:"#555", marginTop:"3px" }}>{dateStr}{timeStr ? ` · ${timeStr}` : ""}</div>
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                /* Transfer History */
+                transfers.length === 0 ? (
+                  <div style={{ color:"#444", fontSize:"13px" }}>No transfers logged yet</div>
+                ) : transfers.map((t, i) => {
+                  const isLatest = i === transfers.length - 1;
+                  const dateStr  = t.date ? new Date(t.date).toLocaleDateString("en-US", { month:"short", day:"numeric", year:"numeric" }) : "—";
+                  return (
+                    <div key={i} style={{ display:"flex", gap:"14px", paddingBottom:isLatest?0:"16px" }}>
+                      <div style={{ display:"flex", flexDirection:"column", alignItems:"center", width:"16px", flexShrink:0 }}>
+                        <div style={{ width:"10px", height:"10px", borderRadius:"50%", background:isLatest?C.orange:"#3a3a44", marginTop:"4px", flexShrink:0 }} />
+                        {!isLatest && <div style={{ width:"2px", flex:1, background:"#2a2a34", marginTop:"4px" }} />}
+                      </div>
+                      <div>
+                        <div style={{ fontWeight:"600", fontSize:"14px", color:isLatest?C.text:C.muted }}>
+                          {t.newOwner}
+                          {isLatest && <span style={{ marginLeft:"8px", fontSize:"11px", color:C.orange }}>Current</span>}
+                        </div>
+                        <div style={{ color:C.muted, fontSize:"12px", marginTop:"2px" }}>{dateStr}</div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ADD TO LIST MODAL
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function AddToListModal({ listName, units, onAddSelected, onConnectNew, onClose }) {
+      const [selected, setSelected] = useState(new Set());
+      const [adding, setAdding]     = useState(false);
+
+      const inList  = units.filter(u => u.list === listName);
+      const outside = units.filter(u => u.list !== listName);
+
+      const toggle = (id) => setSelected(prev => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id); else next.add(id);
+        return next;
+      });
+
+      const handleAdd = async () => {
+        if (selected.size === 0) return;
+        setAdding(true);
+        await onAddSelected([...selected]);
+        setAdding(false);
+      };
+
+      return (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", backdropFilter:"blur(10px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200, padding:"20px" }}>
+          <div style={{ background:"#17171b", border:`1px solid ${C.border}`, borderRadius:"18px", width:"100%", maxWidth:"500px", maxHeight:"85vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 100px rgba(0,0,0,0.7)" }}>
+
+            {/* Header */}
+            <div style={{ padding:"20px 24px", borderBottom:`1px solid ${C.border}`, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+              <div>
+                <div style={{ fontWeight:"700", fontSize:"16px" }}>Add devices to list</div>
+                <div style={{ color:C.muted, fontSize:"13px", marginTop:"3px" }}>"{listName}"</div>
+              </div>
+              <button onClick={onClose} style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:"20px", lineHeight:1 }}>×</button>
+            </div>
+
+            {/* Already in list */}
+            {inList.length > 0 && (
+              <div style={{ padding:"12px 24px", borderBottom:`1px solid ${C.border}`, background:C.item+"60" }}>
+                <div style={{ ...labelSty, marginBottom:"8px" }}>Already in this list ({inList.length})</div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:"6px" }}>
+                  {inList.map(u => (
+                    <span key={u.id} style={{ fontSize:"12px", color:C.muted, background:C.border+"60", borderRadius:"6px", padding:"3px 9px" }}>{u.deviceName}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Device list */}
+            <div style={{ flex:1, overflowY:"auto", padding:"12px 24px" }}>
+              {outside.length === 0 ? (
+                <div style={{ textAlign:"center", padding:"32px 0", color:C.muted, fontSize:"13px" }}>
+                  All registered devices are already in this list
+                </div>
+              ) : (
+                <div style={{ display:"flex", flexDirection:"column", gap:"6px" }}>
+                  {outside.map(u => {
+                    const isChecked = selected.has(u.id);
+                    return (
+                      <div key={u.id} onClick={() => toggle(u.id)}
+                        style={{ display:"flex", alignItems:"center", gap:"12px", padding:"10px 12px", borderRadius:"8px", cursor:"pointer", background: isChecked ? C.orange+"12" : "transparent", border:`1px solid ${isChecked ? C.orange+"50" : C.border}`, transition:"all 0.1s" }}>
+                        <div style={{ width:"18px", height:"18px", borderRadius:"4px", border:`2px solid ${isChecked ? C.orange : C.muted}`, background: isChecked ? C.orange : "transparent", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, transition:"all 0.1s" }}>
+                          {isChecked && <span style={{ color:"#fff", fontSize:"12px", fontWeight:"700", lineHeight:1 }}>✓</span>}
+                        </div>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ fontWeight:"600", fontSize:"14px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{u.deviceName}</div>
+                          <div style={{ color:C.muted, fontSize:"12px", fontFamily:"monospace" }}>{u.serialNumber}</div>
+                        </div>
+                        {u.list && <span style={{ fontSize:"11px", color:C.muted, background:C.border, borderRadius:"20px", padding:"2px 8px", whiteSpace:"nowrap" }}>{u.list}</span>}
+                        {u.owner && u.owner !== "Unregistered" && (
+                          <div style={{ display:"flex", alignItems:"center", gap:"6px", flexShrink:0 }}>
+                            <Avatar name={u.owner} size={22} />
+                            <span style={{ fontSize:"12px", color:C.muted }}>{u.owner}</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div style={{ padding:"16px 24px", borderTop:`1px solid ${C.border}`, display:"flex", gap:"10px" }}>
+              <button onClick={onConnectNew} style={{ ...btnGhost, flex:1 }}>🔗 Connect new device</button>
+              <button onClick={handleAdd} disabled={selected.size === 0 || adding}
+                style={{ ...btnOrange, flex:1, opacity: selected.size === 0 || adding ? 0.5 : 1 }}>
+                {adding ? "Adding…" : selected.size > 0 ? `Add ${selected.size} device${selected.size !== 1 ? "s" : ""}` : "Select devices above"}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // LISTS TAB
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function ListsTab({ lists, units, onAdd, onUpdate, onDelete, onAddDevices }) {
+      const [newName, setNewName]           = useState("");
+      const [adding, setAdding]             = useState(false);
+      const [editId, setEditId]             = useState(null);
+      const [editName, setEditName]         = useState("");
+      const [deleteConfirm, setDeleteConfirm] = useState(null);
+      const [showArchived, setShowArchived] = useState(false);
+      const [expandedId, setExpandedId]     = useState(null);
+
+      const activeLists   = lists.filter(l => !l.archived);
+      const archivedLists = lists.filter(l => l.archived);
+
+      const handleAdd = () => {
+        if (newName.trim()) { onAdd(newName.trim()); setNewName(""); setAdding(false); }
+      };
+
+      const handleRename = (id) => {
+        if (editName.trim()) { onUpdate(id, { name: editName.trim() }); setEditId(null); }
+      };
+
+      const getDevices = (name) => units.filter(u => u.list === name && !u.archived);
+      const getDeviceCount = (name) => getDevices(name).length;
+
+      return (
+        <div>
+          {/* Header row */}
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:"16px" }}>
+            <div style={{ color:C.muted, fontSize:"13px" }}>{activeLists.length} active list{activeLists.length !== 1 ? "s" : ""}</div>
+            {adding ? (
+              <div style={{ display:"flex", gap:"8px" }}>
+                <input value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => { if (e.key==="Enter") handleAdd(); if (e.key==="Escape") { setAdding(false); setNewName(""); } }} placeholder="List name…" style={{ ...inputSty, width:"200px" }} autoFocus />
+                <button onClick={handleAdd} style={btnOrange}>Create</button>
+                <button onClick={() => { setAdding(false); setNewName(""); }} style={btnGhost}>Cancel</button>
+              </div>
+            ) : (
+              <button onClick={() => setAdding(true)} style={btnOrange}>+ New List</button>
+            )}
+          </div>
+
+          {/* Active lists */}
+          {activeLists.length === 0 && !adding ? (
+            <div style={{ ...cardSty, textAlign:"center", padding:"52px 24px", color:C.muted }}>
+              <div style={{ fontSize:"32px", marginBottom:"12px" }}>📋</div>
+              <div style={{ fontWeight:"600", fontSize:"15px", marginBottom:"6px", color:C.text }}>No lists yet</div>
+              <div style={{ fontSize:"13px" }}>Create a list to start grouping devices — e.g. "Lab", "Field Units", "Loaners"</div>
+            </div>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", gap:"10px" }}>
+              {activeLists.map((list, idx) => {
+                const count = getDeviceCount(list.name);
+                const isEditing = editId === list.id;
+                const color = LIST_COLORS[idx % LIST_COLORS.length];
+                const isExpanded = expandedId === list.id;
+                const devices = getDevices(list.name);
+                return (
+                  <div key={list.id} style={{ ...cardSty, padding:0, overflow:"hidden" }}>
+                    {/* List header row */}
+                    <div style={{ display:"flex", alignItems:"center", gap:"14px", padding:"16px 20px" }}>
+                      <div style={{ width:"12px", height:"12px", borderRadius:"50%", background:color, flexShrink:0 }} />
+                      {isEditing ? (
+                        <input value={editName} onChange={e => setEditName(e.target.value)}
+                          onKeyDown={e => { if (e.key==="Enter") handleRename(list.id); if (e.key==="Escape") setEditId(null); }}
+                          style={{ ...inputSty, flex:1 }} autoFocus />
+                      ) : (
+                        <div style={{ flex:1, display:"flex", alignItems:"center", gap:"10px", cursor: count > 0 ? "pointer" : "default" }}
+                          onClick={() => count > 0 && setExpandedId(isExpanded ? null : list.id)}>
+                          <span style={{ fontWeight:"600", fontSize:"15px" }}>{list.name}</span>
+                          <span style={{ color:C.muted, fontSize:"13px" }}>{count} device{count !== 1 ? "s" : ""}</span>
+                          {count > 0 && <span style={{ fontSize:"13px", color:C.muted }}>{isExpanded ? "▾" : "▸"}</span>}
+                        </div>
+                      )}
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        {isEditing ? (
+                          <>
+                            <button onClick={() => handleRename(list.id)} style={{ ...btnSmall, color:C.orange, borderColor:C.orange+"50", background:C.orange+"10" }}>Save</button>
+                            <button onClick={() => setEditId(null)} style={btnSmall}>Cancel</button>
+                          </>
+                        ) : (
+                          <>
+                            <button onClick={() => onAddDevices && onAddDevices(list.name, list.id)} style={{ ...btnSmall, color:C.blue, borderColor:C.blue+"50", background:C.blue+"10" }}>+ Add devices</button>
+                            <button onClick={() => { setEditId(list.id); setEditName(list.name); }} style={btnSmall}>Edit</button>
+                            <button onClick={() => onUpdate(list.id, { archived: true })} style={{ ...btnSmall, color:C.muted }}>Archive</button>
+                            <button onClick={() => setDeleteConfirm(list.id)} style={{ ...btnSmall, color:"#ff7070", borderColor:"#ff3b3b40" }}>Delete</button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Expanded device list */}
+                    {isExpanded && (
+                      <div style={{ borderTop:`1px solid ${C.border}` }}>
+                        {devices.map((u, i) => (
+                          <div key={u.id} style={{ display:"flex", alignItems:"center", gap:"14px", padding:"11px 20px 11px 46px", borderBottom: i < devices.length-1 ? `1px solid ${C.border}40` : "none", background: C.item+"60" }}>
+                            <Avatar name={u.owner || "?"} size={24} />
+                            <div style={{ flex:1, minWidth:0 }}>
+                              <div style={{ fontWeight:"600", fontSize:"13px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{u.deviceName}</div>
+                              <div style={{ color:C.muted, fontSize:"11px", fontFamily:"monospace" }}>{u.serialNumber}</div>
+                            </div>
+                            {u.type && <Tag color={modelColor(u.type)}>{u.type}</Tag>}
+                            {u.owner && <span style={{ fontSize:"12px", color:C.muted, whiteSpace:"nowrap" }}>{u.owner}</span>}
+                            <span style={{ fontSize:"11px", color:"#555", whiteSpace:"nowrap" }}>Last seen: {u.lastSeen || "—"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Archived lists */}
+          {archivedLists.length > 0 && (
+            <div style={{ marginTop:"24px" }}>
+              <button onClick={() => setShowArchived(v => !v)} style={{ background:"none", border:"none", color:C.muted, cursor:"pointer", fontSize:"13px", padding:0, marginBottom:"12px" }}>
+                {showArchived ? "▾" : "▸"} {archivedLists.length} archived list{archivedLists.length !== 1 ? "s" : ""}
+              </button>
+              {showArchived && (
+                <div style={{ display:"flex", flexDirection:"column", gap:"8px" }}>
+                  {archivedLists.map(list => (
+                    <div key={list.id} style={{ ...cardSty, display:"flex", alignItems:"center", gap:"14px", padding:"14px 20px", opacity:0.6 }}>
+                      <div style={{ width:"12px", height:"12px", borderRadius:"50%", background:C.muted, flexShrink:0 }} />
+                      <div style={{ flex:1 }}>
+                        <span style={{ fontWeight:"600", fontSize:"15px" }}>{list.name}</span>
+                      </div>
+                      <div style={{ display:"flex", gap:"8px" }}>
+                        <button onClick={() => onUpdate(list.id, { archived: false })} style={{ ...btnSmall, color:C.green, borderColor:C.green+"50" }}>Restore</button>
+                        <button onClick={() => setDeleteConfirm(list.id)} style={{ ...btnSmall, color:"#ff7070", borderColor:"#ff3b3b40" }}>Delete</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Delete confirmation modal */}
+          {deleteConfirm && (() => {
+            const target = lists.find(l => l.id === deleteConfirm);
+            return (
+              <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", backdropFilter:"blur(10px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:300, padding:"20px" }}>
+                <div style={{ background:"#17171b", border:`1px solid ${C.border}`, borderRadius:"16px", width:"100%", maxWidth:"360px", padding:"28px", boxShadow:"0 32px 100px rgba(0,0,0,0.7)" }}>
+                  <div style={{ fontWeight:"700", fontSize:"16px", marginBottom:"10px" }}>Delete "{target?.name}"?</div>
+                  <div style={{ color:C.muted, fontSize:"13px", lineHeight:"1.6", marginBottom:"24px" }}>Devices in this list won't be deleted — they'll just have no list assigned. This cannot be undone.</div>
+                  <div style={{ display:"flex", gap:"10px" }}>
+                    <button onClick={() => { onDelete(deleteConfirm); setDeleteConfirm(null); }} style={{ ...btnOrange, flex:1, background:"#ef4444", borderColor:"#ef4444" }}>Delete</button>
+                    <button onClick={() => setDeleteConfirm(null)} style={{ ...btnGhost, flex:1 }}>Cancel</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // RENDER
+    // ─────────────────────────────────────────────────────────────────────────
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
