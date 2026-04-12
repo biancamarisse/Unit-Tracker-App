@@ -307,6 +307,18 @@
       const [customTeams, setCustomTeams]       = useState(() => {
         try { return JSON.parse(localStorage.getItem("bb_custom_teams") || "[]"); } catch { return []; }
       });
+      // Dedicated registry: person name (lowercase) → their team. Only written when explicitly set.
+      const [ownerTeamRegistry, setOwnerTeamRegistry] = useState(() => {
+        try { return JSON.parse(localStorage.getItem("bb_owner_teams") || "{}"); } catch { return {}; }
+      });
+      const registerOwnerTeam = React.useCallback((ownerName, team) => {
+        if (!ownerName || !team) return;
+        setOwnerTeamRegistry(prev => {
+          const updated = { ...prev, [ownerName.trim().toLowerCase()]: team };
+          localStorage.setItem("bb_owner_teams", JSON.stringify(updated));
+          return updated;
+        });
+      }, []);
       const [customModels, setCustomModels]     = useState(() => {
         try { return JSON.parse(localStorage.getItem("bb_custom_models") || "[]"); } catch { return []; }
       });
@@ -583,13 +595,12 @@
         }, 600);
       };
 
-      // Build owner→team lookup: stored teams + current user's session team
+      // Build owner→team lookup from the explicit registry only (never inferred from unit data)
       const ownerTeamLookup = React.useMemo(() => {
-        const map = {};
-        units.forEach(u => { if (u.owner && u.team) map[u.owner.toLowerCase()] = u.team; });
+        const map = { ...ownerTeamRegistry };
         if (currentUser && currentTeam) map[currentUser.toLowerCase()] = currentTeam;
         return map;
-      }, [units, currentUser, currentTeam]);
+      }, [ownerTeamRegistry, currentUser, currentTeam]);
 
       // Resolve missing teams for every unit before display
       const resolvedUnits = React.useMemo(() =>
@@ -677,7 +688,7 @@
           </div>
 
           {deviceModal  && <DeviceModal device={deviceModal} currentUser={currentUser} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} lists={lists} onRespond={handleOwnership} onClose={() => setDeviceModal(null)} />}
-          {selectedUnit && <UnitDetailModal unit={resolvedUnits.find(u => u.id === selectedUnit.id) || selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} currentTeam={currentTeam} currentUser={currentUser} customTeams={customTeams} allUnits={resolvedUnits} />}
+          {selectedUnit && <UnitDetailModal unit={resolvedUnits.find(u => u.id === selectedUnit.id) || selectedUnit} allModels={allModels} onAddModel={addModel} allProjects={allProjects} onAddProject={addProject} allEvents={allEvents} onAddEvent={addEvent} lists={lists} onEdit={handleUnitEdit} onDelete={handleUnitDelete} onClose={() => setSelectedUnit(null)} currentTeam={currentTeam} currentUser={currentUser} customTeams={customTeams} allUnits={resolvedUnits} ownerTeamRegistry={ownerTeamRegistry} onRegisterOwnerTeam={registerOwnerTeam} />}
           {addToListModal && <AddToListModal listName={addToListModal.listName} units={units.filter(u => !u.archived)} onAddSelected={async (ids) => { for (const id of ids) { await handleUnitEdit(id, { list: addToListModal.listName }); } setAddToListModal(null); }} onConnectNew={() => handleConnectNewForList(addToListModal.listName)} onClose={() => setAddToListModal(null)} />}
           {showNamePrompt && <NamePromptModal
             extraTeams={customTeams}
@@ -686,6 +697,7 @@
               const fullName = `${first} ${last}`;
               setCurrentUser(fullName); localStorage.setItem("bb_tracker_user", fullName);
               setCurrentTeam(team);     localStorage.setItem("bb_tracker_team", team);
+              registerOwnerTeam(fullName, team);
               if (!DEFAULT_TEAMS.includes(team) && !customTeams.includes(team)) {
                 const updated = [...customTeams, team];
                 setCustomTeams(updated); localStorage.setItem("bb_custom_teams", JSON.stringify(updated));
@@ -1323,7 +1335,7 @@
     // UNIT DETAIL MODAL  (with edit mode)
     // ─────────────────────────────────────────────────────────────────────────
 
-    function UnitDetailModal({ unit, allModels, onAddModel, allProjects, onAddProject, allEvents, onAddEvent, lists, onEdit, onDelete, onClose, currentTeam, currentUser, customTeams = [], allUnits = [] }) {
+    function UnitDetailModal({ unit, allModels, onAddModel, allProjects, onAddProject, allEvents, onAddEvent, lists, onEdit, onDelete, onClose, currentTeam, currentUser, customTeams = [], allUnits = [], ownerTeamRegistry = {}, onRegisterOwnerTeam }) {
       const [transfers, setTransfers]         = useState([]);
       const [editHistory, setEditHistory]     = useState([]);
       const [loadingHist, setLoadingHist]     = useState(false);
@@ -1339,17 +1351,11 @@
       const [editNotes, setEditNotes]         = useState(unit.notes || "");
       const [editEvent, setEditEvent]         = useState(unit.event || "");
       const [editLinks, setEditLinks]         = useState(() => Array.isArray(unit.links) ? [...unit.links] : []);
-      // Build a name→team map from all known units
-      const ownerTeamMap = React.useMemo(() => {
-        const map = {};
-        allUnits.forEach(u => { if (u.owner && u.team) map[u.owner.toLowerCase()] = u.team; });
-        return map;
-      }, [allUnits]);
-
+      // Resolve team from the explicit registry only — never from unit data
       const resolveTeam = (ownerName) => {
         if (!ownerName) return "";
-        if (ownerName.toLowerCase() === (currentUser||"").toLowerCase()) return currentTeam || "";
-        return ownerTeamMap[ownerName.toLowerCase()] || "";
+        if (ownerName.trim().toLowerCase() === (currentUser||"").trim().toLowerCase()) return currentTeam || "";
+        return ownerTeamRegistry[ownerName.trim().toLowerCase()] || "";
       };
 
       const [editTeam, setEditTeam]           = useState(unit.team || "");
@@ -1385,6 +1391,10 @@
         const ownerChanged = editOwner.trim() !== (unit.owner || "").trim();
         // Team only updates when owner changes — otherwise preserve what's stored
         const teamToSave = ownerChanged ? editTeam : unit.team;
+        // Write the confirmed owner→team to the registry so future lookups are correct
+        if (ownerChanged && editTeam && onRegisterOwnerTeam) {
+          onRegisterOwnerTeam(editOwner.trim(), editTeam);
+        }
         await onEdit(unit.id, { deviceName: editName, firmwareVersion: editFw, type: editModel, project: editProject, list: editList, owner: editOwner, notes: editNotes, event: editEvent, links: cleanLinks, team: teamToSave });
         setSaving(false);
         setEditing(false);
