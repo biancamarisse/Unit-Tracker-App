@@ -477,32 +477,41 @@
 
       const handleUnitEdit = async (unitId, changes) => {
         const currentUnit = units.find(u => u.id === unitId);
+        const ownerChanged = currentUnit && changes.owner !== undefined && changes.owner !== currentUnit.owner;
+
+        // Optimistic local update — UI reflects changes immediately
+        setUnits(prev => prev.map(u => u.id === unitId ? { ...u, ...changes } : u));
+
         // Log owner reassignment to session activity
-        if (currentUnit && changes.owner !== undefined && changes.owner !== currentUnit.owner) {
-          const newOwner = changes.owner || "Unassigned";
+        if (ownerChanged) {
           setActivity(p => [{
             icon: "🔄",
-            text: `${currentUnit.deviceName} reassigned to ${newOwner}`,
+            text: `${currentUnit.deviceName} reassigned to ${changes.owner || "Unassigned"}`,
             time: "Just now",
           }, ...p.slice(0, 4)]);
         }
+
         if (IS_CONFIGURED) {
           setSyncing(true);
           try {
             if (currentUnit) {
+              // Edit history: exclude owner + team — those belong in Transfers
               const entries = Object.keys(changes)
+                .filter(k => k !== "owner" && k !== "team")
                 .filter(k => String(changes[k] ?? "") !== String(currentUnit[k] ?? ""))
                 .map(k => ({ field: FIELD_LABELS[k] || k, oldValue: String(currentUnit[k] ?? ""), newValue: String(changes[k] ?? "") }));
               if (entries.length > 0) {
                 saveHistoryCall(currentUnit.serialNumber, currentUnit.deviceName, entries).catch(() => {});
+              }
+              // Owner change → log to Transfers
+              if (ownerChanged) {
+                saveTransfer(currentUnit.serialNumber, currentUnit.deviceName, currentUnit.owner, changes.owner, "reassigned", changes.team || "").catch(() => {});
               }
             }
             await updateUnit(unitId, changes);
             await refresh();
           } catch (e) { setError("Save failed: " + e.message); }
           finally { setSyncing(false); }
-        } else {
-          setUnits(prev => prev.map(u => u.id === unitId ? { ...u, ...changes } : u));
         }
       };
 
