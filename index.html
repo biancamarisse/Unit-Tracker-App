@@ -467,19 +467,40 @@
           setLastEvent({ type:"ownership", device:dm.deviceName, owner });
           setActivity(p => [{ icon:"👤", text:`${owner} took ownership of ${dm.deviceName}`, time:"Just now" }, ...p.slice(0,4)]);
         } else {
+          // "No change" / check-in. For brand-new units we still need to create
+          // the Units row so the device shows up at all — owner is left as
+          // "Unassigned" until someone takes ownership later.
           if (IS_CONFIGURED) {
+            setSyncing(true);
             try {
-              await Promise.all([
-                saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, dm.currentOwner, "check_in", currentTeam),
-                updateUnit(dm.id, { lastSeen: today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{}) }),
-              ]);
+              if (dm.isNew) {
+                await saveOwnership(dm, "Unassigned", fw, model, project, list, currentTeam);
+                await saveTransfer(dm.serialNumber, dm.deviceName, "", "Unassigned", "sighted", currentTeam);
+              } else {
+                await Promise.all([
+                  saveTransfer(dm.serialNumber, dm.deviceName, dm.currentOwner, dm.currentOwner, "check_in", currentTeam),
+                  updateUnit(dm.id, { lastSeen: today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{}) }),
+                ]);
+              }
               await refresh();
-            } catch (_) {}
+            } catch (e) { setError("Save failed: " + e.message); }
+            finally { setSyncing(false); }
           } else {
-            setUnits(prev => prev.map(u => u.serialNumber===dm.serialNumber ? {...u, lastSeen:today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{})} : u));
+            setUnits(prev => {
+              const exists = prev.find(u => u.serialNumber === dm.serialNumber);
+              if (exists) {
+                return prev.map(u => u.serialNumber===dm.serialNumber ? {...u, lastSeen:today, ...(fw?{firmwareVersion:fw}:{}), ...(model?{type:model}:{}), ...(project?{project}:{})} : u);
+              }
+              return [...prev, { id:dm.id, deviceName:dm.deviceName, serialNumber:dm.serialNumber, firmwareVersion:fw||dm.firmwareVersion, type:model||dm.type, project:project||dm.project||"", list:list||dm.list||"", owner:"Unassigned", lastSeen:today }];
+            });
           }
-          setLastEvent({ type:"check", device:dm.deviceName });
-          setActivity(p => [{ icon:"🔍", text:`Checked ${dm.deviceName} — no change`, time:"Just now" }, ...p.slice(0,4)]);
+          if (dm.isNew) {
+            setLastEvent({ type:"check", device:dm.deviceName });
+            setActivity(p => [{ icon:"🆕", text:`Logged ${dm.deviceName} — no owner assigned`, time:"Just now" }, ...p.slice(0,4)]);
+          } else {
+            setLastEvent({ type:"check", device:dm.deviceName });
+            setActivity(p => [{ icon:"🔍", text:`Checked ${dm.deviceName} — no change`, time:"Just now" }, ...p.slice(0,4)]);
+          }
         }
 
         setDeviceModal(null); // close modal only after everything is saved
