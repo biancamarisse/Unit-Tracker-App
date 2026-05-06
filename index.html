@@ -148,51 +148,78 @@
       ]);
     }
 
-    async function readToriFirmwareDirect(usbDevice) {
-      if (!usbDevice.opened) await usbDevice.open();
-      if (!usbDevice.configuration) await usbDevice.selectConfiguration(1);
-
-      // Find the vendor-class interface (0xFF)
-      let ifaceNum = null;
-      for (const iface of usbDevice.configuration.interfaces) {
-        for (const alt of iface.alternates) {
-          if (alt.interfaceClass === TORI_VENDOR_CLASS) {
-            ifaceNum = iface.interfaceNumber;
-            break;
-          }
+    // Locate a Tori device handle, preferring the one passed in but falling
+    // back to navigator.usb.getDevices() (matched by serial) when Chrome
+    // invalidates the original handle mid-enumeration.
+    async function toriResolveDevice(usbDevice) {
+      try {
+        if (usbDevice && !usbDevice.opened) {
+          // No-op probe to test if handle is still valid; throws if disconnected
+          await usbDevice.open();
         }
-        if (ifaceNum !== null) break;
+        return usbDevice;
+      } catch (_) {
+        // fall through
       }
-      if (ifaceNum === null) throw new Error("No vendor-class interface");
+      const all = await navigator.usb.getDevices();
+      const wanted = usbDevice?.serialNumber;
+      const match  = wanted ? all.find(d => d.serialNumber === wanted) : null;
+      return match || all.find(d => d.vendorId === 0x358A) || usbDevice;
+    }
 
-      // Right after a plug-in event the OS is still configuring the device, so
-      // claimInterface can race with that and throw "An operation that changes
-      // interface state is in progress." Retry a few times with backoff.
+    async function readToriFirmwareDirect(usbDevice) {
+      // Retry the open + select-config + find-iface + claim sequence as a unit.
+      // Right after plug-in the OS is still settling, which manifests as one of:
+      //   - "An operation that changes interface state is in progress"
+      //   - "The device was disconnected"
+      // Both are typically transient. Refresh the device handle and retry.
+      const transientRe = /operation that changes interface state|already claimed|device was disconnected|device must be opened/i;
+
+      let device = usbDevice;
+      let ifaceNum = null;
       let lastErr = null;
-      let claimed = false;
-      for (let attempt = 0; attempt < 6; attempt++) {
+      let ready = false;
+
+      for (let attempt = 0; attempt < 8; attempt++) {
         try {
-          await usbDevice.claimInterface(ifaceNum);
-          claimed = true;
+          device = await toriResolveDevice(device);
+          if (!device.opened) await device.open();
+          if (!device.configuration) await device.selectConfiguration(1);
+
+          // Re-discover the vendor interface on each attempt — config might
+          // not have been populated on earlier tries.
+          ifaceNum = null;
+          for (const iface of device.configuration.interfaces) {
+            for (const alt of iface.alternates) {
+              if (alt.interfaceClass === TORI_VENDOR_CLASS) {
+                ifaceNum = iface.interfaceNumber;
+                break;
+              }
+            }
+            if (ifaceNum !== null) break;
+          }
+          if (ifaceNum === null) throw new Error("No vendor-class interface");
+
+          await device.claimInterface(ifaceNum);
+          ready = true;
           break;
         } catch (e) {
           lastErr = e;
           const msg = String(e?.message || e);
-          if (!/operation that changes interface state|already claimed/i.test(msg)) {
-            throw e;
-          }
-          await new Promise(r => setTimeout(r, 250));
+          if (!transientRe.test(msg)) throw e;
+          await new Promise(r => setTimeout(r, 350));
         }
       }
-      if (!claimed) throw lastErr || new Error("Could not claim interface");
+      if (!ready) throw lastErr || new Error("Could not claim interface");
+      const usb = device;
 
       try {
         // 1. iAP2 disable preamble
-        await usbDevice.transferOut(TORI_EP_NUM, TORI_IAP2_DISABLE);
+        await usb.transferOut(TORI_EP_NUM, TORI_IAP2_DISABLE);
 
         // 2. Drain residual iAP2 packets (FF 55 ...) — short-timeout reads
         for (let i = 0; i < 12; i++) {
-          const r = await toriReadWithTimeout(usbDevice, TORI_EP_NUM, 64, 80);
+          const r = await toriReadWithTimeout(usb, TORI_EP_NUM, 64, 80);
           if (!r) break;
           const b = new Uint8Array(r.data.buffer);
           if (b.length === 0) break;
@@ -201,9 +228,9 @@
 
         // 3. Issue a get_parameter and parse the response
         async function getStringParam(commandCode) {
-          await usbDevice.transferOut(TORI_EP_NUM, toriBuildGetParam(commandCode));
+          await usb.transferOut(TORI_EP_NUM, toriBuildGetParam(commandCode));
           for (let attempt = 0; attempt < 20; attempt++) {
-            const r = await toriReadWithTimeout(usbDevice, TORI_EP_NUM, 256, 1000);
+            const r = await toriReadWithTimeout(usb, TORI_EP_NUM, 256, 1000);
             if (!r) continue;
             const b = new Uint8Array(r.data.buffer);
             if (b.length < 12) continue;
@@ -229,7 +256,7 @@
         try { result.color  = await getStringParam(TORI_CMD_COLOR);      } catch (e) { console.warn("[tori] color:",  e.message); }
         return result;
       } finally {
-        try { await usbDevice.releaseInterface(ifaceNum); } catch (_) {}
+        try { await usb.releaseInterface(ifaceNum); } catch (_) {}
       }
     }
 
@@ -600,7 +627,7 @@
               } catch (_) {}
             }
             setDeviceModal({ ...deviceData, currentOwner, lastSeen, isNew });
-          }, 900);
+          }, 1500);
         });
         return cleanup;
       }, []);
@@ -808,7 +835,7 @@
             } catch (_) {}
           }
           setDeviceModal({ ...deviceData, currentOwner, lastSeen, isNew, list: defaultList });
-        }, 600);
+        }, 1500);
       };
 
       // Build owner→team lookup from the explicit registry only (never inferred from unit data)
