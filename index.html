@@ -165,7 +165,26 @@
       }
       if (ifaceNum === null) throw new Error("No vendor-class interface");
 
-      await usbDevice.claimInterface(ifaceNum);
+      // Right after a plug-in event the OS is still configuring the device, so
+      // claimInterface can race with that and throw "An operation that changes
+      // interface state is in progress." Retry a few times with backoff.
+      let lastErr = null;
+      let claimed = false;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          await usbDevice.claimInterface(ifaceNum);
+          claimed = true;
+          break;
+        } catch (e) {
+          lastErr = e;
+          const msg = String(e?.message || e);
+          if (!/operation that changes interface state|already claimed/i.test(msg)) {
+            throw e;
+          }
+          await new Promise(r => setTimeout(r, 250));
+        }
+      }
+      if (!claimed) throw lastErr || new Error("Could not claim interface");
 
       try {
         // 1. iAP2 disable preamble
