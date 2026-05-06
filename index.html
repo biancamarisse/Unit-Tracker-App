@@ -103,48 +103,115 @@
           serialNumber:    d.serialNumber || "UNKNOWN",
           firmwareVersion: "",
           type:            "Unknown",
-        });
+        }, d);
       };
       navigator.usb.addEventListener("connect", handler);
       return () => navigator.usb.removeEventListener("connect", handler);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // LOCAL HELPER BRIDGE
+    // WEBUSB-DIRECT FIRMWARE READ
     //
-    // Optional companion: a Python daemon (helper/tori_firmware_helper.py) that
-    // uses the Tori SDK to read firmware and exposes it on localhost. We fetch
-    // it before opening the plug-in modal so the firmware field is pre-filled.
-    // If the helper isn't running, we silently fall back to a blank field.
+    // Talks the Tori vendor protocol (VID 0x358A, vendor class 0xFF) directly
+    // from the browser. Sends the iAP2-disable preamble plus four
+    // device-info get_parameter commands and parses their responses.
+    // Eliminates the need for any local helper / Python SDK install.
+    //
+    // Byte format (reverse-engineered from a USB capture, 2026-05-06):
+    //   command  = 00 53 | 01 00 | 00 00 | <code:u16 LE> | 00 00 00 00
+    //   response = 00 53 | 81 00 | 00 00 | <code:u16 LE> | <len:u32 LE> | <payload>
     // ─────────────────────────────────────────────────────────────────────────
 
-    const HELPER_URL = "http://127.0.0.1:39402/firmware";
+    const TORI_VENDOR_CLASS = 0xFF;
+    const TORI_EP_NUM       = 2;            // Both 0x02 OUT and 0x82 IN are endpoint 2
+    const TORI_IAP2_DISABLE = new Uint8Array([0xFF, 0x55, 0x00, 0x00]);
+    const TORI_CMD_SERIAL     = 0x01;
+    const TORI_CMD_FW_VERSION = 0x04;
+    const TORI_CMD_MODEL_NAME = 0x07;
+    const TORI_CMD_COLOR      = 0x0D;
 
-    async function fetchHelperFirmware(serialNumber, timeoutMs = 1500) {
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-        const res = await fetch(HELPER_URL, { signal: ctrl.signal, cache: "no-store" });
-        clearTimeout(timer);
-        if (!res.ok) return null;
-        const data = await res.json();
-        if (!data || !data.connected) return null;
-        // If the helper just saw a different device, don't trust it for this serial.
-        if (serialNumber && data.serial && data.serial !== serialNumber) return null;
-        return data;
-      } catch (_) {
-        return null;
-      }
+    function toriBuildGetParam(commandCode) {
+      return new Uint8Array([
+        0x00, 0x53,
+        0x01, 0x00,
+        0x00, 0x00,
+        commandCode & 0xFF, (commandCode >> 8) & 0xFF,
+        0x00, 0x00, 0x00, 0x00,
+      ]);
     }
 
-    // Same fetch with a few retries — gives the helper time to settle after USB enumeration.
-    async function fetchHelperFirmwareWithRetry(serialNumber, attempts = 3, perAttemptMs = 1000) {
-      for (let i = 0; i < attempts; i++) {
-        const data = await fetchHelperFirmware(serialNumber, perAttemptMs);
-        if (data) return data;
-        await new Promise(r => setTimeout(r, 400));
+    // transferIn with a soft timeout. Returns the WebUSB result or null on timeout.
+    async function toriReadWithTimeout(device, ep, len, ms) {
+      return Promise.race([
+        device.transferIn(ep, len),
+        new Promise(resolve => setTimeout(() => resolve(null), ms)),
+      ]);
+    }
+
+    async function readToriFirmwareDirect(usbDevice) {
+      if (!usbDevice.opened) await usbDevice.open();
+      if (!usbDevice.configuration) await usbDevice.selectConfiguration(1);
+
+      // Find the vendor-class interface (0xFF)
+      let ifaceNum = null;
+      for (const iface of usbDevice.configuration.interfaces) {
+        for (const alt of iface.alternates) {
+          if (alt.interfaceClass === TORI_VENDOR_CLASS) {
+            ifaceNum = iface.interfaceNumber;
+            break;
+          }
+        }
+        if (ifaceNum !== null) break;
       }
-      return null;
+      if (ifaceNum === null) throw new Error("No vendor-class interface");
+
+      await usbDevice.claimInterface(ifaceNum);
+
+      try {
+        // 1. iAP2 disable preamble
+        await usbDevice.transferOut(TORI_EP_NUM, TORI_IAP2_DISABLE);
+
+        // 2. Drain residual iAP2 packets (FF 55 ...) — short-timeout reads
+        for (let i = 0; i < 12; i++) {
+          const r = await toriReadWithTimeout(usbDevice, TORI_EP_NUM, 64, 80);
+          if (!r) break;
+          const b = new Uint8Array(r.data.buffer);
+          if (b.length === 0) break;
+          if (b[0] !== 0xFF) break;          // not iAP2; stop draining
+        }
+
+        // 3. Issue a get_parameter and parse the response
+        async function getStringParam(commandCode) {
+          await usbDevice.transferOut(TORI_EP_NUM, toriBuildGetParam(commandCode));
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const r = await toriReadWithTimeout(usbDevice, TORI_EP_NUM, 256, 1000);
+            if (!r) continue;
+            const b = new Uint8Array(r.data.buffer);
+            if (b.length < 12) continue;
+            if (b[0] !== 0x00 || b[1] !== 0x53) continue;     // skip iAP2 / unknown
+            if ((b[2] & 0x7F) !== 0x01) continue;             // not get_parameter response
+            const code = b[6] | (b[7] << 8);
+            if (code !== commandCode) continue;
+            const len  = b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
+            if (b.length < 12 + len) continue;
+            const payload = b.slice(12, 12 + len);
+            // Strip trailing nulls just in case
+            let end = payload.length;
+            while (end > 0 && payload[end - 1] === 0) end--;
+            return new TextDecoder("utf-8").decode(payload.slice(0, end));
+          }
+          throw new Error(`No response for command 0x${commandCode.toString(16)}`);
+        }
+
+        const result = {};
+        try { result.serial = await getStringParam(TORI_CMD_SERIAL);     } catch (e) { console.warn("[tori] serial:", e.message); }
+        try { result.fw     = await getStringParam(TORI_CMD_FW_VERSION); } catch (e) { console.warn("[tori] fw:",     e.message); }
+        try { result.model  = await getStringParam(TORI_CMD_MODEL_NAME); } catch (e) { console.warn("[tori] model:",  e.message); }
+        try { result.color  = await getStringParam(TORI_CMD_COLOR);      } catch (e) { console.warn("[tori] color:",  e.message); }
+        return result;
+      } finally {
+        try { await usbDevice.releaseInterface(ifaceNum); } catch (_) {}
+      }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -216,6 +283,8 @@
       const [team,        setTeam]        = useState(initialData?.team      || "");
       const [addingTeam,  setAddingTeam]  = useState(false);
       const [newTeamVal,  setNewTeamVal]  = useState("");
+      const [showSetup,   setShowSetup]   = useState(false);
+      const isWindows = typeof navigator !== "undefined" && /Win/.test(navigator.platform || "");
       const allTeams = [...DEFAULT_TEAMS, ...extraTeams.filter(t => !DEFAULT_TEAMS.includes(t))];
       const isValid = firstName.trim() && lastName.trim() && team.trim();
 
@@ -278,6 +347,47 @@
                   </button>
                 )}
               </div>
+            </div>
+
+            {/* ── First-time setup tips ─────────────────────────────────── */}
+            <div style={{ background:C.item, border:`1px solid ${C.border}`, borderRadius:"10px", padding:"0", marginBottom:"16px", overflow:"hidden" }}>
+              <button
+                onClick={() => setShowSetup(s => !s)}
+                style={{ width:"100%", background:"transparent", border:"none", padding:"12px 14px", display:"flex", alignItems:"center", justifyContent:"space-between", cursor:"pointer", color:C.text, fontSize:"13px", fontWeight:"600" }}>
+                <span style={{ display:"flex", alignItems:"center", gap:"8px" }}>
+                  <span style={{ color:C.orange }}>⚙</span>
+                  First-time setup tips
+                  <span style={{ fontSize:"11px", color:C.muted, fontWeight:"500" }}>{isWindows ? "(includes Windows step)" : ""}</span>
+                </span>
+                <span style={{ color:C.muted, fontSize:"12px" }}>{showSetup ? "▾" : "▸"}</span>
+              </button>
+              {showSetup && (
+                <div style={{ padding:"6px 14px 16px 14px", borderTop:`1px solid ${C.border}` }}>
+                  <ol style={{ listStyle:"none", padding:0, margin:0, display:"flex", flexDirection:"column", gap:"12px" }}>
+                    <li style={{ display:"flex", gap:"10px" }}>
+                      <span style={{ flexShrink:0, width:"22px", height:"22px", borderRadius:"50%", background:C.orange+"22", color:C.orange, display:"flex", alignItems:"center", justifyContent:"center", fontSize:"11px", fontWeight:"700", marginTop:"1px" }}>1</span>
+                      <div style={{ fontSize:"12.5px", lineHeight:"1.5", color:C.text }}>
+                        <strong>Use Chrome or Edge.</strong>
+                        <span style={{ color:C.muted }}> Firmware auto-detection uses WebUSB, which Safari and Firefox don't support.</span>
+                      </div>
+                    </li>
+                    <li style={{ display:"flex", gap:"10px" }}>
+                      <span style={{ flexShrink:0, width:"22px", height:"22px", borderRadius:"50%", background:C.orange+"22", color:C.orange, display:"flex", alignItems:"center", justifyContent:"center", fontSize:"11px", fontWeight:"700", marginTop:"1px" }}>2</span>
+                      <div style={{ fontSize:"12.5px", lineHeight:"1.5", color:C.text }}>
+                        <strong>Windows users: install the WinUSB driver once via Zadig.</strong>
+                        <span style={{ color:C.muted }}> Plug a Tori in, then go to <a href="https://zadig.akeo.ie" target="_blank" rel="noopener" style={{ color:C.orange, textDecoration:"none" }}>zadig.akeo.ie</a> → Options → List All Devices → pick Tori → set driver to <code style={{ background:C.bg, padding:"1px 5px", borderRadius:"4px", fontSize:"11px" }}>WinUSB</code> → Install Driver. Mac users skip this step.</span>
+                      </div>
+                    </li>
+                    <li style={{ display:"flex", gap:"10px" }}>
+                      <span style={{ flexShrink:0, width:"22px", height:"22px", borderRadius:"50%", background:C.orange+"22", color:C.orange, display:"flex", alignItems:"center", justifyContent:"center", fontSize:"11px", fontWeight:"700", marginTop:"1px" }}>3</span>
+                      <div style={{ fontSize:"12.5px", lineHeight:"1.5", color:C.text }}>
+                        <strong>First plug-in: click "Connect Device".</strong>
+                        <span style={{ color:C.muted }}> Your browser will ask for permission to talk to the Tori — pick it from the list. After that, plug-ins are detected automatically and the modal opens with firmware pre-filled.</span>
+                      </div>
+                    </li>
+                  </ol>
+                </div>
+              )}
             </div>
 
             <button onClick={submit} disabled={!isValid}
@@ -444,17 +554,23 @@
       }, []);
 
       useEffect(() => {
-        const cleanup = listenForUSB((deviceData) => {
+        const cleanup = listenForUSB((deviceData, usbDevice) => {
           setConnecting(true);
           setTimeout(async () => {
             setConnecting(false);
-            // Try the helper bridge first — fills firmware/model/color if available
-            const helperInfo = await fetchHelperFirmwareWithRetry(deviceData.serialNumber);
-            if (helperInfo) {
-              if (helperInfo.fw)         deviceData.firmwareVersion = helperInfo.fw;
-              if (helperInfo.deviceName) deviceData.deviceName      = helperInfo.deviceName;
-              if (helperInfo.model)      deviceData.type            = helperInfo.model;
-              deviceData.fwAutoDetected = true;
+            // Read firmware/model/color directly from the device via WebUSB.
+            try {
+              const info = await readToriFirmwareDirect(usbDevice);
+              if (info.fw)     deviceData.firmwareVersion = info.fw;
+              if (info.model)  deviceData.type            = info.model;
+              if (info.serial) deviceData.serialNumber    = info.serial;
+              const niceName = [info.model, info.color].filter(s => s && s.length).join(" - ");
+              if (niceName) deviceData.deviceName = niceName;
+              if (info.fw || info.model || info.color || info.serial) {
+                deviceData.fwAutoDetected = true;
+              }
+            } catch (e) {
+              console.warn("[tori] direct firmware read failed:", e?.message);
             }
             let currentOwner = "Unregistered", lastSeen = "Never", isNew = true;
             if (IS_CONFIGURED) {
@@ -650,13 +766,19 @@
         setConnecting(true);
         setTimeout(async () => {
           setConnecting(false);
-          // Try the helper bridge first — fills firmware/model/color if available
-          const helperInfo = await fetchHelperFirmwareWithRetry(deviceData.serialNumber);
-          if (helperInfo) {
-            if (helperInfo.fw)         deviceData.firmwareVersion = helperInfo.fw;
-            if (helperInfo.deviceName) deviceData.deviceName      = helperInfo.deviceName;
-            if (helperInfo.model)      deviceData.type            = helperInfo.model;
-            deviceData.fwAutoDetected = true;
+          // Read firmware/model/color directly from the device via WebUSB.
+          try {
+            const info = await readToriFirmwareDirect(usbDevice);
+            if (info.fw)     deviceData.firmwareVersion = info.fw;
+            if (info.model)  deviceData.type            = info.model;
+            if (info.serial) deviceData.serialNumber    = info.serial;
+            const niceName = [info.model, info.color].filter(s => s && s.length).join(" - ");
+            if (niceName) deviceData.deviceName = niceName;
+            if (info.fw || info.model || info.color || info.serial) {
+              deviceData.fwAutoDetected = true;
+            }
+          } catch (e) {
+            console.warn("[tori] direct firmware read failed:", e?.message);
           }
           let currentOwner = "Unregistered", lastSeen = "Never", isNew = true;
           if (IS_CONFIGURED) {
