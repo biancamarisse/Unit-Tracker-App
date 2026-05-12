@@ -180,11 +180,21 @@
       let lastErr = null;
       let ready = false;
 
-      for (let attempt = 0; attempt < 8; attempt++) {
+      for (let attempt = 0; attempt < 10; attempt++) {
         try {
           device = await toriResolveDevice(device);
-          if (!device.opened) await device.open();
-          if (!device.configuration) await device.selectConfiguration(1);
+
+          if (!device.opened) {
+            await device.open();
+            // Let the OS finish wiring up after open() before we poke further
+            await new Promise(r => setTimeout(r, 200));
+          }
+          if (!device.configuration) {
+            await device.selectConfiguration(1);
+            // SET_CONFIGURATION is itself an "interface state change" — give
+            // the kernel time to settle before claimInterface
+            await new Promise(r => setTimeout(r, 250));
+          }
 
           // Re-discover the vendor interface on each attempt — config might
           // not have been populated on earlier tries.
@@ -207,7 +217,8 @@
           lastErr = e;
           const msg = String(e?.message || e);
           if (!transientRe.test(msg)) throw e;
-          await new Promise(r => setTimeout(r, 350));
+          // Progressive backoff: 300, 500, 700, 900, 1100... ms
+          await new Promise(r => setTimeout(r, 300 + attempt * 200));
         }
       }
       if (!ready) throw lastErr || new Error("Could not claim interface");
@@ -1267,12 +1278,44 @@
 
       const [saving, setSaving]     = useState(false);
       const [saveLabel, setSaveLabel] = useState("");
+      const [detecting, setDetecting] = useState(false);
+      const [detectErr, setDetectErr] = useState("");
+      const [autoDetected, setAutoDetected] = useState(!!device.fwAutoDetected);
 
       const respond = async (take) => {
         setSaveLabel(take ? "Assigning to you…" : "Logging check-in…");
         setSaving(true);
         try { await onRespond(take, fw, model, project, list); }
         finally { setSaving(false); }
+      };
+
+      // Manual "Detect firmware" — re-runs readToriFirmwareDirect on demand,
+      // looking up the device by serial via navigator.usb.getDevices(). Useful
+      // when the auto-detect on plug-in lost the WebUSB race.
+      const manualDetect = async () => {
+        if (!navigator.usb) { setDetectErr("WebUSB not supported in this browser"); return; }
+        setDetectErr("");
+        setDetecting(true);
+        try {
+          const all = await navigator.usb.getDevices();
+          const dev = all.find(d => d.serialNumber === device.serialNumber)
+                   || all.find(d => d.vendorId === 0x358A);
+          if (!dev) {
+            setDetectErr("Couldn't find the Tori — try plugging it in again");
+            return;
+          }
+          const info = await readToriFirmwareDirect(dev);
+          if (info.fw)    setFw(info.fw);
+          if (info.model) setModel(info.model);
+          if (info.fw || info.model || info.color) setAutoDetected(true);
+          if (!info.fw && !info.model && !info.color) {
+            setDetectErr("Device opened, but no fields came back. Check console for [tori] warnings.");
+          }
+        } catch (e) {
+          setDetectErr(e?.message || "Read failed");
+        } finally {
+          setDetecting(false);
+        }
       };
 
       return (
@@ -1424,11 +1467,21 @@
                 <div style={{ display:"flex", alignItems:"baseline", gap:"8px", marginBottom:"6px" }}>
                   <div style={labelSty}>Firmware Version</div>
                   <span style={{ fontSize:"11px", color:C.muted }}>optional</span>
-                  {device.fwAutoDetected && fw && (
+                  {autoDetected && fw && (
                     <span style={{ fontSize:"10px", fontWeight:"700", color:C.green, background:C.green+"22", border:`1px solid ${C.green}40`, borderRadius:"10px", padding:"2px 7px", letterSpacing:"0.4px", marginLeft:"auto" }}>AUTO-DETECTED</span>
                   )}
+                  <button onClick={manualDetect} disabled={detecting}
+                    title="Read firmware directly from the device via WebUSB"
+                    style={{ marginLeft: (autoDetected && fw) ? "8px" : "auto", background:"transparent", border:`1px solid ${C.border}`, color: detecting ? C.muted : C.blue, fontSize:"10px", fontWeight:"700", letterSpacing:"0.4px", padding:"3px 8px", borderRadius:"10px", cursor: detecting ? "wait" : "pointer" }}>
+                    {detecting ? "DETECTING…" : (fw ? "RE-DETECT" : "DETECT")}
+                  </button>
                 </div>
                 <input value={fw} onChange={e => setFw(e.target.value)} placeholder="e.g. v2.5.1" style={{ ...inputSty, fontFamily:"monospace", fontSize:"13px" }} />
+                {detectErr && (
+                  <div style={{ marginTop:"6px", fontSize:"11px", color:"#f87171", lineHeight:"1.4" }}>
+                    {detectErr}
+                  </div>
+                )}
               </div>
 
               <div style={{ background:C.item, border:`1px solid ${C.border}`, borderRadius:"10px", padding:"16px", marginBottom:"18px" }}>
